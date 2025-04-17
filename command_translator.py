@@ -143,6 +143,7 @@ def _format_bytes(byte_count: int | None) -> str:
 
 # --- Translation Functions ---
 
+
 # === File System ===
 def translate_ls(args: list[str]) -> str | None:
     parser = NonExitingArgumentParser(prog='ls', add_help=False)
@@ -391,31 +392,47 @@ def translate_chown(args: list[str]) -> str | None:
 # === Text Processing ===
 def translate_cat(args: list[str]) -> str | None:
     parser = NonExitingArgumentParser(prog='cat', add_help=False)
-    # Add -n for line numbering?
     parser.add_argument('-n', '--number', action='store_true', help='Number output lines')
     parser.add_argument('files', nargs='*') # Allow reading from stdin if no files
-    try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"cat: {e}"); return NO_EXEC_MARKER + "cat failed"
+    try:
+        parsed_args = parser.parse_args(args)
+    except ValueError as e:
+        ui_manager.display_error(f"cat: {e}")
+        return NO_EXEC_MARKER + "cat failed"
 
+    # --- Check for Special Path Handling ---
+    if len(parsed_args.files) == 1:
+        normalized_path = parsed_args.files[0].lower().replace('\\', '/')
+        if normalized_path in SPECIAL_CAT_PATHS:
+            powershell_cmd = SPECIAL_CAT_PATHS[normalized_path]
+            if parsed_args.number:
+                ui_manager.display_warning(f"cat: Flag '-n' ignored when displaying equivalent for '{parsed_args.files[0]}'")
+            # Add context comment (already included in most scripts above, but keep for others)
+            context_comment = f"# Showing Windows equivalent for: {parsed_args.files[0]}"
+            # Check if the script already adds its own comment
+            if not powershell_cmd.strip().startswith("Write-Host '# Windows"):
+                 return f"Write-Host '{context_comment}' -ForegroundColor Gray; {powershell_cmd}"
+            else:
+                 return powershell_cmd # Script handles its own context message
+
+    # --- Default Behavior (Get-Content or Stdin) ---
     base_cmd = "Get-Content"
     params = []
     post_cmds = []
 
     if not parsed_args.files:
-        # Read from pipeline/stdin. PowerShell handles this implicitly if Get-Content has no path.
-        # We assume input is piped correctly by the shell_core execution if needed.
-        # Alternatively, could explicitly use `$input | Get-Content` but that's redundant?
-        pass # Rely on PowerShell's pipeline input
+        pass # Relies on PowerShell's pipeline input for Get-Content
     else:
-        params.extend([shlex.quote(f) for f in parsed_args.files])
+        params.extend([f"-LiteralPath {shlex.quote(f)}" for f in parsed_args.files])
+        params.append("-ErrorAction SilentlyContinue")
 
     if parsed_args.number:
-        # PowerShell way to number lines: add line number to each object
-        post_cmds.append('Select-Object @{N=\'LineNumber\';E={$_.ReadCount}}, @{N=\'Line\';E={$_}}')
-        post_cmds.append('Format-Table -HideTableHeaders LineNumber,Line') # Attempt to format like cat -n
+        post_cmds.append('$global:lineNumber = 0; Foreach-Object { $global:lineNumber++; Write-Host ("{0,6}  {1}" -f $global:lineNumber, $_) }')
 
     full_cmd = f"{base_cmd} {' '.join(params)}"
-    if post_cmds: full_cmd += " | " + " | ".join(post_cmds)
+    if post_cmds:
+        full_cmd += " | " + " | ".join(post_cmds)
+
     return full_cmd
 
 def translate_grep(args: list[str]) -> str | None:
@@ -1060,3 +1077,162 @@ if __name__ == "__main__":
             print("  -> Native Command")
         else:
             print("  -> Translation/Simulation Failed or Unexpected Result")
+
+# --- Special Path Mappings for 'cat' ---
+# Maps lowercase Linux paths to PowerShell commands providing equivalent info
+SPECIAL_CAT_PATHS = {
+    # Filesystem Table Equivalent (/etc/fstab)
+    "/etc/fstab": r"""
+        Write-Host '# Windows Volume Information (Simulated /etc/fstab)' -ForegroundColor Gray;
+        Write-Host '# <file system>                              <mount point>   <type>     <options>       <dump> <pass>';
+
+        # Local volumes with drive letters
+        Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object {
+            $fs = $_.Path; # GUID Path like \\?\Volume{...}\
+            $mp = "$($_.DriveLetter):\";
+            $type = if ($_.FileSystem) { $_.FileSystem } else { 'unknown' };
+            $options = 'defaults'; # Simplified placeholder
+            $dump = 0;
+            $pass = 0;
+            Write-Host ("{0,-45} {1,-15} {2,-10} {3,-15} {4} {5}" -f $fs, $mp, $type, $options, $dump, $pass);
+        };
+
+        # Page file (swap equivalent) - may list multiple if configured
+        Get-CimInstance Win32_PageFileSetting | ForEach-Object {
+            $fs = $_.Name; # e.g., C:\pagefile.sys
+            $mp = 'swap';
+            $type = 'swap';
+            $options = 'defaults';
+            $dump = 0;
+            $pass = 0;
+            Write-Host ("{0,-45} {1,-15} {2,-10} {3,-15} {4} {5}" -f $fs, $mp, $type, $options, $dump, $pass);
+        };
+
+        # Mapped network drives (using Get-PSDrive)
+        Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot -like '\\*' } | ForEach-Object {
+             $fs = $_.DisplayRoot; # UNC Path like \\server\share
+             $mp = "$($_.Name):\"; # Drive Letter
+             $type = 'cifs'; # Assuming CIFS/SMB
+             $options = 'defaults'; # Could check persistence? Get-SmbMapping needed
+             $dump = 0;
+             $pass = 0;
+             Write-Host ("{0,-45} {1,-15} {2,-10} {3,-15} {4} {5}" -f $fs, $mp, $type, $options, $dump, $pass);
+        }
+    """,
+
+    # Hosts File (Actual Path) - Remains the same, shows real content
+    "/etc/hosts": r'Get-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts"',
+
+    # DNS Resolver Info (/etc/resolv.conf)
+    "/etc/resolv.conf": r"""
+        Write-Host '# Windows DNS Configuration (Simulated /etc/resolv.conf)' -ForegroundColor Gray;
+        # Get search list per interface (often empty on clients)
+        Get-DnsClient | Select-Object -ExpandProperty ConnectionSpecificSuffix | Where-Object {$_} | ForEach-Object {
+             Write-Host ("search {0}" -f $_);
+        };
+        # Get global search list
+        $globalSearch = (Get-DnsClientGlobalSetting).SuffixSearchList;
+        if ($globalSearch) { Write-Host ("search {0}" -f ($globalSearch -join ' ')) };
+
+        # Get DNS Servers per interface (IPv4)
+        Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresses} | ForEach-Object {
+            Write-Host ("# Interface $($_.InterfaceAlias) ($($_.InterfaceIndex))" -ForegroundColor Gray);
+            $_.ServerAddresses | ForEach-Object { Write-Host "nameserver $_" };
+        }
+    """,
+
+    # CPU Info (/proc/cpuinfo)
+    "/proc/cpuinfo": r"""
+        Write-Host '# Windows CPU Information (Simulated /proc/cpuinfo)' -ForegroundColor Gray;
+        $processors = Get-CimInstance Win32_Processor;
+        $processorIndex = 0;
+        foreach ($proc in $processors) {
+            Write-Host "processor`t: $processorIndex";
+            Write-Host "vendor_id`t: $($proc.Manufacturer)";
+            Write-Host "model name`t: $($proc.Name)";
+            Write-Host "cpu family`t: $($proc.Family)"; # Needs mapping to Linux numbers if possible
+            Write-Host "model`t`t: $($proc.Description)"; # Often contains more detail
+            Write-Host "stepping`t: $($proc.Stepping)";
+            Write-Host "cpu MHz`t`t: $($proc.CurrentClockSpeed)"; # MaxSpeed might be more stable?
+            Write-Host "cache size`t: $($proc.L2CacheSize) KB (L2) / $($proc.L3CacheSize) KB (L3)";
+            Write-Host "physical id`t: $($proc.SocketDesignation)";
+            # Siblings/cores require more complex calculation using logical processors info
+            $cores = $proc.NumberOfCores;
+            $logical = $proc.NumberOfLogicalProcessors;
+            Write-Host "cpu cores`t: $cores";
+            Write-Host "siblings`t: $logical"; # This is total logical per package usually
+            Write-Host "flags`t`t: (Not directly available, see Get-ComputerInfo for features)";
+            Write-Host ""; # Separator between processors
+            $processorIndex++;
+        }
+    """,
+
+    # Memory Info (/proc/meminfo)
+    "/proc/meminfo": r"""
+        Write-Host '# Windows Memory Information (Simulated /proc/meminfo)' -ForegroundColor Gray;
+        $mem = Get-CimInstance Win32_OperatingSystem;
+        $cs = Get-CimInstance Win32_ComputerSystem;
+        $pm = Get-Counter '\Memory\Available KBytes'; # Physical Memory Available
+
+        $totalMB = [math]::Round($mem.TotalVisibleMemorySize / 1024);
+        $freeMB = [math]::Round($mem.FreePhysicalMemory / 1024);
+        $availMB = [math]::Round($pm.CounterSamples[0].CookedValue / 1024); # Available is often more useful than Free
+
+        Write-Host ("MemTotal:`t{0,10} kB" -f $mem.TotalVisibleMemorySize);
+        Write-Host ("MemFree:`t{0,10} kB" -f $mem.FreePhysicalMemory); # Free = Unused
+        Write-Host ("MemAvailable:`t{0,10} kB" -f ($availMB * 1024)); # Available = Free + Cache/Buffers usable by apps
+
+        # Swap information is complex (multiple page files possible)
+        $swapTotal = (Get-CimInstance Win32_PageFileUsage | Measure-Object -Property AllocatedBaseSize -Sum).Sum / 1KB;
+        $swapUsed = (Get-CimInstance Win32_PageFileUsage | Measure-Object -Property CurrentUsage -Sum).Sum / 1KB;
+        $swapFree = $swapTotal - $swapUsed;
+        Write-Host ("SwapTotal:`t{0,10} kB" -f $swapTotal);
+        Write-Host ("SwapFree:`t{0,10} kB" -f $swapFree);
+
+        # Other common fields (placeholders or N/A)
+        Write-Host ("Buffers:`t{0,10} kB" -f 0); # Not directly equivalent/easily obtained
+        Write-Host ("Cached:`t`t{0,10} kB" -f 0); # System Cache is complex, Get-Counter '\Memory\Cache Bytes' exists
+        Write-Host ("Slab:`t`t{0,10} kB" -f 0); # N/A
+    """,
+
+    # OS / Distribution Info (/etc/os-release)
+    "/etc/os-release": r"""
+        Write-Host '# Windows OS Information (Simulated /etc/os-release)' -ForegroundColor Gray;
+        $os = Get-CimInstance Win32_OperatingSystem;
+        $ci = Get-ComputerInfo; # Get-ComputerInfo is slower but provides more structured info
+
+        $name = $os.Caption;
+        # Try to create a simpler ID
+        $id = $name -replace '[^a-zA-Z0-9]+', '' -replace 'Microsoft', '' | Out-String;
+        $id = $id.Trim().ToLower();
+
+        Write-Host ("NAME=`"{0}`"" -f $name);
+        Write-Host ("VERSION=`"{0} (Build {1})`"" -f $os.Version, $os.BuildNumber);
+        Write-Host ("ID={0}" -f $id);
+        # Attempt VERSION_ID (like 22H2) - requires parsing or specific registry keys, complex. Placeholder:
+        Write-Host ("VERSION_ID=`"{0}`"" -f $os.Version);
+        Write-Host ("PRETTY_NAME=`"{0}`"" -f $name);
+        Write-Host ("ANSI_COLOR=`"0;34`""); # Blue for Windows?
+        Write-Host ("HOME_URL=`"https://www.microsoft.com/windows/`"");
+        Write-Host ("SUPPORT_URL=`"https://support.microsoft.com/windows`"");
+        Write-Host ("BUG_REPORT_URL=`"https://support.microsoft.com/windows`"");
+    """,
+    "/etc/lsb-release": r"""
+        Write-Host '# Windows OS Information (Simulated /etc/lsb-release)' -ForegroundColor Gray;
+        $os = Get-CimInstance Win32_OperatingSystem;
+        $name = $os.Caption;
+        # Try to create a simpler ID
+        $id = $name -replace '[^a-zA-Z0-9]+', '' -replace 'Microsoft', '' | Out-String;
+        $id = $id.Trim().ToLower();
+
+        Write-Host ("DISTRIB_ID={0}" -f $id);
+        Write-Host ("DISTRIB_RELEASE={0}" -f $os.Version);
+        Write-Host ("DISTRIB_CODENAME=Windows"); # Placeholder
+        Write-Host ("DISTRIB_DESCRIPTION=`"{0}`"" -f $name);
+    """,
+
+    # User Info (/etc/passwd) - Guide remains best approach due to complexity/security
+    "/etc/passwd": "'# Showing current user info via whoami. For full user list use: Get-LocalUser' -ForegroundColor Gray; whoami /user /fo list",
+    # Group Info (/etc/group) - Guide remains best approach
+    "/etc/group": "'# Showing current user groups via whoami. For full group list use: Get-LocalGroup' -ForegroundColor Gray; whoami /groups /fo list",
+}
