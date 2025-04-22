@@ -6,6 +6,7 @@ import subprocess
 import shlex
 import copy # For deep copying environment
 import base64 # For encoding elevated commands
+import json # For reading/writing aliases
 
 import ui_manager
 import command_translator
@@ -14,18 +15,68 @@ import command_translator
 SIMULATION_MARKER_PREFIX = command_translator.SIMULATION_MARKER_PREFIX
 NO_EXEC_MARKER = command_translator.NO_EXEC_MARKER
 
+# --- Configuration File Paths ---
+APP_DATA_DIR = os.getenv('APPDATA')
+SWODNIL_CONFIG_DIR = os.path.join(APP_DATA_DIR, "Swodnil") if APP_DATA_DIR else None
+ALIAS_FILE_PATH = os.path.join(SWODNIL_CONFIG_DIR, "aliases.json") if SWODNIL_CONFIG_DIR else None
+
+# --- Helper Function for Saving Aliases ---
+def _save_aliases(aliases_to_save: dict):
+    """Saves the current aliases to the JSON file."""
+    if not ALIAS_FILE_PATH:
+        ui_manager.display_warning("Cannot save aliases: APPDATA environment variable not found.")
+        return
+
+    try:
+        # Ensure the directory exists
+        config_dir = os.path.dirname(ALIAS_FILE_PATH)
+        dir_existed_before = os.path.exists(config_dir)
+        if not dir_existed_before:
+            os.makedirs(config_dir, exist_ok=True) # exist_ok=True prevents error if it was created between check and makedirs
+
+        # Write the JSON file
+        with open(ALIAS_FILE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(aliases_to_save, f, indent=4, sort_keys=True)
+
+        # Notify user only if the directory was newly created
+        if not dir_existed_before:
+             # Use warning style, but mention the path clearly
+             ui_manager.display_warning(
+                 f"Created configuration directory and alias file at: {ALIAS_FILE_PATH}"
+             )
+
+    except Exception as e:
+        ui_manager.display_error(f"Failed to save aliases to {ALIAS_FILE_PATH}: {e}")
+
+# --- Main Shell Function ---
 def run_shell():
     """Runs the main Read-Evaluate-Print Loop (REPL) for Swodnil."""
 
     # Shell State
     command_history: list[str] = []
-    aliases: dict[str, str] = {
+    # Define default aliases first
+    default_aliases: dict[str, str] = {
         'll': 'ls -l',
         'la': 'ls -la',
     }
-    # Start with a copy of the current process environment
-    # Modifications via 'export'/'unset' only affect commands run *through* Swodnil
-    shell_environment = copy.deepcopy(os.environ)
+    aliases = default_aliases.copy() # Start with defaults
+    
+    shell_environment = copy.deepcopy(os.environ) # Copy current environment
+
+    # --- Load Persistent Aliases ---
+    if ALIAS_FILE_PATH and os.path.exists(ALIAS_FILE_PATH):
+        try:
+            with open(ALIAS_FILE_PATH, 'r', encoding='utf-8') as f:
+                loaded_aliases = json.load(f)
+                if isinstance(loaded_aliases, dict):
+                    aliases.update(loaded_aliases) # Merge loaded, overwriting defaults if necessary
+                else:
+                    ui_manager.display_warning(f"Ignoring invalid alias file content: {ALIAS_FILE_PATH}")
+        except json.JSONDecodeError:
+            ui_manager.display_warning(f"Could not parse alias file (invalid JSON): {ALIAS_FILE_PATH}")
+        except Exception as e:
+            ui_manager.display_warning(f"Could not load aliases from {ALIAS_FILE_PATH}: {e}")
+    # --- End Load ---
 
     while True:
         # 1. Read Input
@@ -86,7 +137,7 @@ def run_shell():
 
         if cmd_lower == 'alias':
             if not args: # Print all aliases
-                alias_items = [f"{name}='{cmd}'" for name, cmd in aliases.items()]
+                alias_items = [f"{name}='{cmd}'" for name, cmd in sorted(aliases.items())] # Sort output
                 ui_manager.display_list(alias_items, title="Aliases")
             elif '=' in args[0]: # Define alias
                 try:
@@ -95,6 +146,7 @@ def run_shell():
                     elif cmd.startswith('"') and cmd.endswith('"'): cmd = cmd[1:-1]
                     aliases[name] = cmd
                     ui_manager.display_info(f"Alias '{name}' set.")
+                    _save_aliases(aliases) # <-- Save after setting
                 except ValueError:
                      ui_manager.display_error("alias: invalid format. Use name='command'")
             else: # Print specific alias
@@ -103,7 +155,7 @@ def run_shell():
                       ui_manager.console.print(f"alias {name_to_show}='{aliases[name_to_show]}'")
                  else:
                       ui_manager.display_error(f"alias: {name_to_show}: not found")
-            continue # Handled internally
+            continue
 
         if cmd_lower == 'unalias':
             if not args: ui_manager.display_error("unalias: missing alias name")
@@ -112,9 +164,10 @@ def run_shell():
                 if name_to_remove in aliases:
                     del aliases[name_to_remove]
                     ui_manager.display_info(f"Alias '{name_to_remove}' removed.")
+                    _save_aliases(aliases) # <-- Save after removing
                 else:
                      ui_manager.display_error(f"unalias: {name_to_remove}: not found")
-            continue # Handled internally
+            continue
 
         if cmd_lower == 'export':
             if not args: ui_manager.display_error("export: invalid format. Use export NAME=VALUE")

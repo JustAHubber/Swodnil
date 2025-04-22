@@ -5,29 +5,51 @@ import os
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+from rich.live import Live
+from rich.spinner import Spinner
 import pyfiglet
 import time
+import sys
 
 # Initialize the Rich Console globally
 console = Console()
 
 def display_startup():
-    """Displays the cool ASCII art startup sequence - Line by Line."""
-    console.clear() # Start with a clear screen (optional)
-    try:
-        ascii_banner_str = pyfiglet.figlet_format("Swodnil", font="slant")
-        lines = ascii_banner_str.splitlines()
-        delay = 0.25 # Adjust delay between lines (seconds)
+    """Displays a loading sequence followed by the static ASCII art banner."""
+    console.clear() # Start clean
+    console.print() # Initial newline for spacing
 
-        console.print() # Initial newline
-        for line in lines:
-            console.print(f"[bold magenta]{line}[/bold magenta]")
-            time.sleep(delay)
-        console.print() # Extra newline after banner
+    # --- Phase 1: Short Loading Sequence ---
+    loading_stages = [
+        ("Initializing Swodnil Core...", 0.4),
+        ("Loading translation matrix...", 0.5),
+        ("Engaging PowerShell bridge...", 0.3),
+        ("Done!", 0.1)
+    ]
+    spinner = Spinner("dots", text=" Starting...")
+
+    try:
+        with Live(spinner, refresh_per_second=10, transient=True) as live:
+            for text, delay in loading_stages:
+                spinner.update(text=f" {text}")
+                live.refresh()
+                time.sleep(delay)
+        # Spinner disappears automatically here
+    except Exception as e:
+         console.print(f"[yellow]Warning: Loading animation skipped due to error: {e}[/yellow]")
+
+
+    # --- Phase 2: Static ASCII Banner ---
+    try:
+        ascii_banner_str = pyfiglet.figlet_format("Swodnil", font="slant") # Or your preferred font
+        styled_banner = f"\n[bold magenta]{ascii_banner_str}[/bold magenta]\n" # Add spacing
+
+        # Print the fully formed banner at once
+        console.print(styled_banner)
 
     except Exception as e:
         # Fallback if pyfiglet fails
-        console.print("[bold magenta] S W O D N I L [/bold magenta]")
+        console.print(f"\n[bold magenta] S W O D N I L [/bold magenta]\n")
         console.print(f"[yellow]Note: pyfiglet banner failed: {e}[/yellow]")
 
     console.print("[magenta]Welcome to Swodnil - A Linux to Windows command translator![/magenta]")
@@ -39,11 +61,11 @@ def display_help_page():
     console.print() # Add spacing before the help page
     console.print(Panel(
         "[bold red]Welcome to Swodnil, a program built by Daolyap[/]\n\n"
-        "A command-line interface providing a Linux-like experience on Windows.\n"
-        "It translates many common Linux commands and flags into their PowerShell equivalents."
+        "Swodnil is a command-line interface providing a Linux-like experience on Windows.\n"
+        "It translates many common Linux commands and flags into their PowerShell equivalents.\n"
         "I am open to suggestions!",
         title="Swodnil Help",
-        border_style="magenta",
+        border_style="red",
         expand=False
     ))
     console.print()
