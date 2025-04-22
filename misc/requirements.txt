@@ -1,3 +1,4 @@
 rich
 pyfiglet
 psutil
+prompt_toolkit
