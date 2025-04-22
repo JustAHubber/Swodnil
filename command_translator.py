@@ -398,22 +398,26 @@ def translate_cat(args: list[str]) -> str | None:
         parsed_args = parser.parse_args(args)
     except ValueError as e:
         ui_manager.display_error(f"cat: {e}")
-        return NO_EXEC_MARKER + "cat failed"
+        return NO_EXEC_MARKER + "cat failed", False # Return tuple
 
     # --- Check for Special Path Handling ---
     if len(parsed_args.files) == 1:
         normalized_path = parsed_args.files[0].lower().replace('\\', '/')
         if normalized_path in SPECIAL_CAT_PATHS:
-            powershell_cmd = SPECIAL_CAT_PATHS[normalized_path]
+            powershell_cmd_tuple = SPECIAL_CAT_PATHS[normalized_path]
+            powershell_cmd, needs_elevation = powershell_cmd_tuple
+
             if parsed_args.number:
                 ui_manager.display_warning(f"cat: Flag '-n' ignored when displaying equivalent for '{parsed_args.files[0]}'")
-            # Add context comment (already included in most scripts above, but keep for others)
+
+            # Context comment handling (same as before)
             context_comment = f"# Showing Windows equivalent for: {parsed_args.files[0]}"
-            # Check if the script already adds its own comment
             if not powershell_cmd.strip().startswith("Write-Host '# Windows"):
-                 return f"Write-Host '{context_comment}' -ForegroundColor Gray; {powershell_cmd}"
+                 final_cmd = f"Write-Host '{context_comment}' -ForegroundColor Gray; {powershell_cmd}"
             else:
-                 return powershell_cmd # Script handles its own context message
+                 final_cmd = powershell_cmd
+
+            return final_cmd, needs_elevation # Return tuple
 
     # --- Default Behavior (Get-Content or Stdin) ---
     base_cmd = "Get-Content"
@@ -433,12 +437,14 @@ def translate_cat(args: list[str]) -> str | None:
     if post_cmds:
         full_cmd += " | " + " | ".join(post_cmds)
 
-    return full_cmd
+    return full_cmd, False # Default cat does not need elevation
 
-def translate_grep(args: list[str]) -> str | None:
+# === Text Processing ===
+
+def translate_grep(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='grep', add_help=False); parser.add_argument('-i', '--ignore-case', action='store_true'); parser.add_argument('-v', '--invert-match', action='store_true'); parser.add_argument('-n', '--line-number', action='store_true'); parser.add_argument('-r','-R', '--recursive', action='store_true'); parser.add_argument('pattern'); parser.add_argument('files', nargs='*')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"grep: {e}"); return NO_EXEC_MARKER + "grep failed"
+    except ValueError as e: ui_manager.display_error(f"grep: {e}"); return NO_EXEC_MARKER + "grep failed", False
 
     select_string_cmd = "Select-String"
     ss_params = [f"-Pattern {shlex.quote(parsed_args.pattern)}"]
@@ -446,54 +452,70 @@ def translate_grep(args: list[str]) -> str | None:
     if parsed_args.invert_match: ss_params.append("-NotMatch")
     # -n is handled implicitly by Select-String object output, format if needed
 
+    result_cmd = ""
     if not parsed_args.files:
         # Handle stdin - assume input piped to Select-String
-        return f"{select_string_cmd} {' '.join(ss_params)}"
+        result_cmd = f"{select_string_cmd} {' '.join(ss_params)}"
     elif parsed_args.recursive:
         # Use Get-ChildItem | Select-String for recursion
-        gci_params = ["-Recurse", "-File"] # Search only files
+        gci_params = ["-Recurse", "-File", "-ErrorAction SilentlyContinue"] # Search only files, ignore errors on GCI
         # Need to quote file paths if they are patterns for GCI
         gci_params.extend([shlex.quote(f) for f in parsed_args.files])
-        return f"Get-ChildItem {' '.join(gci_params)} | {select_string_cmd} {' '.join(ss_params)}"
+        result_cmd = f"Get-ChildItem {' '.join(gci_params)} | {select_string_cmd} {' '.join(ss_params)}"
     else:
         # Search specific files
-        ss_params.append("-Path")
+        ss_params.append("-LiteralPath") # Use LiteralPath for safety
         ss_params.extend([shlex.quote(f) for f in parsed_args.files])
-        return f"{select_string_cmd} {' '.join(ss_params)}"
+        # Add error action to Select-String as well for missing files
+        ss_params.append("-ErrorAction SilentlyContinue")
+        result_cmd = f"{select_string_cmd} {' '.join(ss_params)}"
 
-def translate_head_tail(cmd_name: str, args: list[str]) -> str | None:
+    return result_cmd, False # grep doesn't typically need elevation
+
+
+def translate_head_tail(cmd_name: str, args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog=cmd_name, add_help=False); parser.add_argument('-n', '--lines', type=int, default=10); (cmd_name == 'tail') and parser.add_argument('-f', '--follow', action='store_true'); parser.add_argument('file', nargs='?', default=None) # Allow stdin
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed"
+    except ValueError as e: ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed", False
 
     base_cmd = "Get-Content"; params = []
-    if parsed_args.file: params.append(shlex.quote(parsed_args.file))
+    if parsed_args.file:
+        params.append(f"-LiteralPath {shlex.quote(parsed_args.file)}")
+        params.append("-ErrorAction SilentlyContinue") # Handle file not found
     # else: assumes reading from pipeline/stdin
 
-    selector = "-Head" if cmd_name == 'head' else "-Tail"
-    params.append(f"{selector} {parsed_args.lines}")
+    selector = "-First" if cmd_name == 'head' else "-Last" # Use -First/-Last for pipeline compatibility
+    # selector = "-Head" if cmd_name == 'head' else "-Tail" # These work better directly with Get-Content file path
 
-    if cmd_name == 'tail' and parsed_args.follow:
-        if not parsed_args.file:
-             ui_manager.display_error(f"tail -f: requires a file argument, cannot follow stdin.")
-             return NO_EXEC_MARKER + "tail -f failed"
-        params.append("-Wait")
+    # Decide which selector to use based on whether input is likely piped or from file
+    if not parsed_args.file:
+        # Likely pipeline input, use -First / -Last
+        selector = "-First" if cmd_name == 'head' else "-Last"
+        # Build the command differently for pipeline
+        if cmd_name == 'tail' and parsed_args.follow:
+            ui_manager.display_error("tail -f: cannot follow pipeline input.")
+            return NO_EXEC_MARKER + "tail -f failed", False
+        return f"Select-Object {selector} {parsed_args.lines}", False
+    else:
+        # File input, use -Head / -Tail directly on Get-Content
+        selector = "-Head" if cmd_name == 'head' else "-Tail"
+        params.append(f"{selector} {parsed_args.lines}")
+        if cmd_name == 'tail' and parsed_args.follow:
+             params.append("-Wait")
+        return f"{base_cmd} {' '.join(params)}", False
 
-    return f"{base_cmd} {' '.join(params)}"
-
-def translate_head(args: list[str]) -> str | None: return translate_head_tail('head', args)
-def translate_tail(args: list[str]) -> str | None: return translate_head_tail('tail', args)
+def translate_head(args: list[str]) -> tuple[str | None, bool]: return translate_head_tail('head', args)
+def translate_tail(args: list[str]) -> tuple[str | None, bool]: return translate_head_tail('tail', args)
 
 # === System Information & Management ===
-def translate_hostname(args: list[str]) -> str | None:
-    if args: ui_manager.display_error("hostname: does not support arguments."); return NO_EXEC_MARKER + "hostname failed"
-    # Environment variable is most direct
-    return 'Write-Host $env:COMPUTERNAME'
+def translate_hostname(args: list[str]) -> tuple[str | None, bool]:
+    if args: ui_manager.display_error("hostname: does not support arguments."); return NO_EXEC_MARKER + "hostname failed", False
+    return 'Write-Host $env:COMPUTERNAME', False
 
-def translate_uname(args: list[str]) -> str | None:
+def translate_uname(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='uname', add_help=False); parser.add_argument('-a', '--all', action='store_true'); parser.add_argument('-s', '--kernel-name', action='store_true'); parser.add_argument('-n', '--nodename', action='store_true'); parser.add_argument('-r', '--kernel-release', action='store_true'); parser.add_argument('-v', '--kernel-version', action='store_true'); parser.add_argument('-m', '--machine', action='store_true'); parser.add_argument('-o', '--operating-system', action='store_true')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"uname: {e}"); return NO_EXEC_MARKER + "uname failed"
+    except ValueError as e: ui_manager.display_error(f"uname: {e}"); return NO_EXEC_MARKER + "uname failed", False
     results = []; sys_system = platform.system(); sys_release = platform.release(); sys_version = platform.version(); sys_machine = platform.machine(); sys_node = platform.node()
     if not any([parsed_args.all, parsed_args.kernel_name, parsed_args.nodename, parsed_args.kernel_release, parsed_args.kernel_version, parsed_args.machine, parsed_args.operating_system]): parsed_args.kernel_name = True
     if parsed_args.kernel_name or parsed_args.all: results.append(sys_system)
@@ -502,186 +524,244 @@ def translate_uname(args: list[str]) -> str | None:
     if parsed_args.kernel_version or parsed_args.all: results.append(sys_version)
     if parsed_args.machine or parsed_args.all: results.append(sys_machine)
     if parsed_args.operating_system or parsed_args.all: (sys_system not in results) and results.append(sys_system)
-    return f"Write-Host \"{' '.join(results)}\""
+    return f"Write-Host \"{' '.join(results)}\"", False
 
-def translate_df(args: list[str]) -> str | None:
+def translate_df(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='df', add_help=False); parser.add_argument('-h', '--human-readable', action='store_true'); parser.add_argument('files', nargs='*')
-    # Add -T to show filesystem type? Get-Volume includes it.
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"df: {e}"); return NO_EXEC_MARKER + "df failed"
-    base_cmd = "Get-Volume"; params = [];
-    # Use Get-PSDrive for potentially more linux-like output? It shows Used/Free.
-    # base_cmd = "Get-PSDrive"
-    # params = ["-PSProvider FileSystem"] # Filter for filesystem drives
+    except ValueError as e: ui_manager.display_error(f"df: {e}"); return NO_EXEC_MARKER + "df failed", False
 
-    format_cmd = "| Format-Table DriveLetter, FileSystemLabel, @{N='Size';E={$_.Size}}, @{N='Free';E={$_.SizeRemaining}}, @{N='Use%';E={if($_.Size -gt 0){[int]((($_.Size - $_.SizeRemaining)/$_.Size)*100)}else{0}}}"
-    if parsed_args.files:
-        # Get-Volume supports -FilePath, Get-PSDrive doesn't directly
-        params.extend([f"-FilePath {shlex.quote(f)}" for f in parsed_args.files])
+    # Get-Volume might need elevation for certain details, Get-PSDrive usually doesn't
+    # Let's try Get-PSDrive first as it's less likely to require elevation
+    base_cmd = "Get-PSDrive"
+    params = ["-PSProvider FileSystem"]
+    needs_elevation = False # Assume false for Get-PSDrive
+
+    # Format-Bytes helper function (defined within the command string)
+    format_bytes_func = (
+        "$FormatBytes = {param($bytes) if ($bytes -eq $null) {'N/A'} elseif ($bytes -ge 1GB) {{'{0:N2} GiB' -f ($bytes / 1GB)}} "
+        "elseif ($bytes -ge 1MB) {{'{0:N1} MiB' -f ($bytes / 1MB)}} elseif ($bytes -ge 1KB) {{'{0:N1} KiB' -f ($bytes / 1KB)}} "
+        "else {{'{0} B' -f $bytes}}}; "
+    )
+
+    # Define properties to select and format
+    properties = [
+        "Name",
+        "@{N='Size';E={($_.Used + $_.Free)}}",
+        "Used",
+        "Free",
+        "@{N='Use%';E={if (($_.Used + $_.Free) -gt 0) {[int]($_.Used / ($_.Used + $_.Free) * 100)} else {0} }}",
+        "Root" # Mountpoint
+    ]
+    human_readable_properties = [
+        "Name",
+        "@{N='Size';E={& $FormatBytes ($_.Used + $_.Free)}}",
+        "@{N='Used';E={& $FormatBytes $_.Used}}",
+        "@{N='Free';E={& $FormatBytes $_.Free}}",
+        "@{N='Use%';E={if (($_.Used + $_.Free) -gt 0) {[int]($_.Used / ($_.Used + $_.Free) * 100)} else {0} }}",
+        "Root" # Mountpoint
+    ]
+
+    select_props = properties
+    prefix_cmd = ""
     if parsed_args.human_readable:
-        format_cmd = "| Format-Table DriveLetter, FileSystemLabel, @{N='Size';E={Format-Bytes $_.Size}}, @{N='Free';E={Format-Bytes $_.SizeRemaining}}, @{N='Use%';E={if($_.Size -gt 0){[int]((($_.Size - $_.SizeRemaining)/$_.Size)*100)}else{0}}}"
-        # Define Format-Bytes helper function in PS scope if needed, or do calculation directly
-        format_cmd = ("$FormatBytes = {param($bytes) if ($bytes -ge 1GB) {{'{0:N2} GiB' -f ($bytes / 1GB)}} elseif ($bytes -ge 1MB) {{'{0:N1} MiB' -f ($bytes / 1MB)}} elseif ($bytes -ge 1KB) {{'{0:N1} KiB' -f ($bytes / 1KB)}} else {{'{0} B' -f $bytes}}};"
-                      f"{base_cmd} {' '.join(params)} | Format-Table DriveLetter, FileSystemLabel, @{{N='Size';E={{& $FormatBytes $_.Size}}}}, @{{N='Free';E={{& $FormatBytes $_.SizeRemaining}}}}, @{{N='Use%';E={{if($_.Size -gt 0){{[int]((($_.Size - $_.SizeRemaining)/$_.Size)*100)}}else{{0}}}}}}")
-        return format_cmd # Return early as it includes helper func definition
+        select_props = human_readable_properties
+        prefix_cmd = format_bytes_func
 
-    return f"{base_cmd} {' '.join(params)} {format_cmd}"
+    if parsed_args.files:
+        # Get-PSDrive doesn't take file paths directly. Get volume for path, then drive name.
+        # This makes it more complex. Fallback to Get-Volume which is simpler but needs elevation.
+        ui_manager.display_warning("df: Path filtering currently requires Get-Volume (may need elevation).")
+        base_cmd = "Get-Volume"
+        params = [] # Reset params for Get-Volume
+        params.extend([f"-FilePath {shlex.quote(f)}" for f in parsed_args.files])
+        needs_elevation = True # Get-Volume likely needs elevation
+        # Adjust properties for Get-Volume output
+        properties_vol = [
+             "DriveLetter",
+             "@{N='Size';E={$_.Size}}",
+             "@{N='Used';E={($_.Size - $_.SizeRemaining)}}",
+             "@{N='Avail';E={$_.SizeRemaining}}", # Available on Windows is SizeRemaining
+             "@{N='Use%';E={if($_.Size -gt 0){[int]((($_.Size - $_.SizeRemaining)/$_.Size)*100)}else{0}}}",
+             "@{N='Mounted on';E={$_.Path}}" # Path is the mount point
+        ]
+        human_readable_properties_vol = [
+             "DriveLetter",
+             "@{N='Size';E={& $FormatBytes $_.Size}}",
+             "@{N='Used';E={& $FormatBytes ($_.Size - $_.SizeRemaining)}}",
+             "@{N='Avail';E={& $FormatBytes $_.SizeRemaining}}",
+             "@{N='Use%';E={if($_.Size -gt 0){[int]((($_.Size - $_.SizeRemaining)/$_.Size)*100)}else{0}}}",
+             "@{N='Mounted on';E={$_.Path}}"
+        ]
+        select_props = properties_vol
+        if parsed_args.human_readable:
+             select_props = human_readable_properties_vol
+             prefix_cmd = format_bytes_func
+        else:
+             prefix_cmd = "" # No helper needed if not human readable
 
-def translate_ps(args: list[str]) -> str | None:
+    format_cmd = f"| Select-Object {','.join(select_props)} | Format-Table -AutoSize"
+    full_cmd = f"{prefix_cmd}{base_cmd} {' '.join(params)} {format_cmd}"
+
+    return full_cmd, needs_elevation
+
+
+def translate_ps(args: list[str]) -> tuple[str | None, bool]:
     """Translates ps to Get-Process."""
     parser = NonExitingArgumentParser(prog='ps', add_help=False)
-    parser.add_argument('ax', nargs='?', help='Common combined flag ax') # Treat 'ax' specially
-    parser.add_argument('-e', '-A', action='store_true', help='Select all processes') # Default Get-Process
+    parser.add_argument('ax', nargs='?', help='Common combined flag ax')
+    parser.add_argument('-e', '-A', action='store_true', help='Select all processes')
     parser.add_argument('-f', action='store_true', help='Full format listing (more details)')
     parser.add_argument('-u', action='store_true', help='User-oriented format (show user)')
-    parser.add_argument('x', nargs='?', help='Ignored x flag often used with a') # Treat 'x' specially if combined like 'aux'
+    parser.add_argument('x', nargs='?', help='Ignored x flag often used with a')
 
-    # Simplistic handling for common combined flags like 'ax', 'aux', 'ef'
     raw_args_str = "".join(args)
     show_all = '-e' in raw_args_str or '-A' in raw_args_str or 'a' in raw_args_str
     full_format = '-f' in raw_args_str
     user_format = '-u' in raw_args_str
 
-    # Base command
     base_cmd = "Get-Process"
-    params = []
+    params = ["-ErrorAction SilentlyContinue"] # Ignore errors for processes that disappear
     format_cmd = "| Format-Table -AutoSize" # Default table
 
-    # Select properties based on flags
     properties = ["Id", "ProcessName"] # Minimal default
     if full_format or user_format:
-        properties = ["Id", "Handles", "CPU", "SI", "WS", "ProcessName"] # Default PS view
+        properties = ["Id", "Handles", "CPU", "SI", "WS", "ProcessName"]
     if user_format:
-        # Getting username requires another call or calculated property
-        # Let's add StartTime and maybe CPU time for 'user' oriented view
-        # Get-Process | Select-Object Id, UserName (needs calc), CPU, StartTime ...
-        # Simplification: use default properties but maybe format differently
-        properties = ["Id", "CPU", "StartTime", "ProcessName"] # Simplified user view
-        format_cmd = "| Format-Table Id, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, @{N='START';E={$_.StartTime.ToString('HH:mm')}}, ProcessName -AutoSize"
+        # Getting username can require elevation or be slow. Use IncludeUserName parameter.
+        params.append("-IncludeUserName")
+        properties = ["UserName", "Id", "CPU", "StartTime", "ProcessName"]
+        format_cmd = "| Format-Table UserName, Id, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, @{N='START';E={$_.StartTime.ToString('HH:mm')}}, ProcessName -AutoSize"
+        needs_elevation = True # IncludeUserName often needs elevation
+        return f"{base_cmd} {' '.join(params)} {format_cmd}", needs_elevation
     elif full_format:
-        # Add more details like Path
         properties = ["Id", "Handles", "CPU", "WS", "Path"]
         format_cmd = "| Format-Table Id, Handles, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, @{N='WS(MB)';E={[math]::Round($_.WS / 1MB)}}, Path -AutoSize"
 
-    # If no specific format requested, use standard detailed view
     if not full_format and not user_format:
-         properties = ["Id", "ProcessName", "CPU", "WS"] # A reasonable default
+         properties = ["Id", "ProcessName", "CPU", "WS"]
          format_cmd = "| Format-Table Id, ProcessName, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, @{N='WS(MB)';E={[math]::Round($_.WS / 1MB)}} -AutoSize"
 
+    # Default ps doesn't need elevation unless -u is used
+    return f"{base_cmd} {' '.join(params)} | Select-Object {','.join(properties)} {format_cmd}", False
 
-    return f"{base_cmd} {' '.join(params)} | Select-Object {','.join(properties)} {format_cmd}"
 
-def translate_top(args: list[str]) -> str | None:
-    """Translates top to a static Get-Process snapshot sorted by CPU."""
-    # top doesn't usually take file args, ignore args for basic translation
-    if args:
-        ui_manager.display_warning("top: Arguments are ignored in this basic translation.")
-
-    # Get processes, sort by CPU descending, take top 15, format nicely
-    # Select properties relevant to 'top' (ID, Name, CPU, Memory(WS))
-    cmd = (
-        "Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 "
-        "Id, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, "
-        "@{N='Mem(MB)';E={[math]::Round($_.WS / 1MB)}}, ProcessName "
-        "| Format-Table -AutoSize"
-    )
-    return cmd
-
-def translate_id(args: list[str]) -> str | None:
-    """Translates id to whoami (basic user info)."""
-    if args:
-        ui_manager.display_warning("id: Arguments are ignored, using 'whoami'.")
-    # whoami provides the basic username, similar to the primary part of id output.
-    # Use 'whoami /all' for more detail closer to Linux 'id' (SID, groups)
-    # Let's start simple:
-    return "whoami"
-
-def translate_kill(args: list[str]) -> str | None:
+def translate_kill(args: list[str]) -> tuple[str | None, bool]:
     """Translates kill/killall to Stop-Process."""
-    # kill [-s signal] pid...
-    # killall name...
-    # Stop-Process [-Id] pid... | -Name name... [-Force]
     parser = NonExitingArgumentParser(prog='kill/killall', add_help=False)
     parser.add_argument('-s', '--signal', default='TERM', help='Signal name/number (ignored, maps to Stop-Process)')
     parser.add_argument('-9', dest='force_kill', action='store_true', help='Force kill (SIGKILL, maps to -Force)')
     parser.add_argument('targets', nargs='+', help='Process IDs or names (for killall)')
-    # Determine if it's kill (pids) or killall (names) based on command name later
     try:
         parsed_args = parser.parse_args(args)
-        # Crude check: if targets look like numbers, assume PID, else assume name
         is_pid = all(t.isdigit() for t in parsed_args.targets)
     except ValueError as e:
-        ui_manager.display_error(f"kill/killall: {e}"); return NO_EXEC_MARKER + "kill failed"
+        ui_manager.display_error(f"kill/killall: {e}"); return NO_EXEC_MARKER + "kill failed", False
 
     base_cmd = "Stop-Process"
-    params = []
+    params = ["-ErrorAction SilentlyContinue"] # Don't stop script if one process fails
 
     if is_pid:
         params.append("-Id")
         params.extend(parsed_args.targets)
     else:
-        # Assumed killall or kill by name (less common for kill)
         params.append("-Name")
         params.extend([shlex.quote(t) for t in parsed_args.targets])
 
     if parsed_args.force_kill or parsed_args.signal in ['KILL', '9']:
         params.append("-Force")
 
-    # Ignore other signal types as Stop-Process doesn't map them
+    # Stop-Process might need elevation to kill certain processes (e.g., system processes, other users')
+    needs_elevation = True # Assume elevation might be needed
 
-    return f"{base_cmd} {' '.join(params)}"
+    return f"{base_cmd} {' '.join(params)}", needs_elevation
 
+
+def translate_top(args: list[str]) -> tuple[str | None, bool]:
+    """Translates top to a static Get-Process snapshot sorted by CPU."""
+    if args: ui_manager.display_warning("top: Arguments are ignored in this basic translation.")
+    # Get-Process itself doesn't need elevation, but sorting by CPU and getting details is fine non-elevated.
+    cmd = (
+        "Get-Process -ErrorAction SilentlyContinue | Sort-Object CPU -Descending | Select-Object -First 15 "
+        "Id, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, "
+        "@{N='Mem(MB)';E={[math]::Round($_.WS / 1MB)}}, ProcessName "
+        "| Format-Table -AutoSize"
+    )
+    return cmd, False
+
+def translate_id(args: list[str]) -> tuple[str | None, bool]:
+    """Translates id to whoami (basic user info)."""
+    if args: ui_manager.display_warning("id: Arguments are ignored, using 'whoami /all'.")
+    # Use whoami /all for more detail like groups, closer to Linux id
+    return "whoami /all /fo list", False # /fo list for readability
 
 # === Network ===
-def translate_ifconfig(args: list[str]) -> str | None:
+def translate_ifconfig(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='ifconfig', add_help=False); parser.add_argument('interface', nargs='?')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"ifconfig: {e}"); return NO_EXEC_MARKER + "ifconfig failed"
-    if parsed_args.interface: iface = shlex.quote(parsed_args.interface); return f"Get-NetIPConfiguration -InterfaceAlias {iface} | Format-List; Get-NetAdapter -Name {iface} | Format-List Status, LinkSpeed, MacAddress"
-    else: return "ipconfig /all"
+    except ValueError as e: ui_manager.display_error(f"ifconfig: {e}"); return NO_EXEC_MARKER + "ifconfig failed", False
+    # Get-Net* cmdlets usually don't need elevation for read operations
+    if parsed_args.interface:
+        iface = shlex.quote(parsed_args.interface)
+        cmd = f"Get-NetIPConfiguration -InterfaceAlias {iface} -ErrorAction SilentlyContinue | Format-List; Get-NetAdapter -Name {iface} -ErrorAction SilentlyContinue | Format-List Status, LinkSpeed, MacAddress"
+    else:
+        # ipconfig /all is generally better than Get-NetIPConfiguration for overall view
+        cmd = "ipconfig /all"
+        # Get-NetIPConfiguration | Format-List works too but less comprehensive than ipconfig /all
+        # cmd = "Get-NetIPConfiguration -ErrorAction SilentlyContinue | Format-List"
+    return cmd, False
 
-def translate_whois(args: list[str]) -> str | None:
+def translate_whois(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='whois', add_help=False); parser.add_argument('domain')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"whois: {e}"); return NO_EXEC_MARKER + "whois failed"
-    domain = shlex.quote(parsed_args.domain); ui_manager.console.print(f"[dim]Attempting 'whois {domain}'. Requires external 'whois.exe' in PATH.[/dim]"); return f"whois {domain}"
+    except ValueError as e: ui_manager.display_error(f"whois: {e}"); return NO_EXEC_MARKER + "whois failed", False
+    domain = shlex.quote(parsed_args.domain); ui_manager.console.print(f"[dim]Attempting 'whois {domain}'. Requires external 'whois.exe' in PATH.[/dim]");
+    # Assume external whois doesn't need elevation
+    return f"whois {domain}", False
 
-def translate_dig(args: list[str]) -> str | None:
+def translate_dig(args: list[str]) -> tuple[str | None, bool]:
     try:
         if not args: raise ValueError("Missing name")
-        name = args[0]; qtype = 'A'
-        if len(args) > 1 and args[1].upper() in ['A', 'AAAA', 'MX', 'TXT', 'CNAME', 'NS', 'SOA', 'SRV', 'ANY']: qtype = args[1].upper()
-    except ValueError as e: ui_manager.display_error(f"dig: {e}"); return NO_EXEC_MARKER + "dig failed"
-    return f"Resolve-DnsName -Name {shlex.quote(name)} -Type {qtype} -CacheOnly:$false -DnsOnly" # DnsOnly for closer dig behavior
+        name = args[0]; qtype = 'A'; server = None
+        idx = 1
+        while idx < len(args):
+            arg_upper = args[idx].upper()
+            if arg_upper.startswith('@'): server = args[idx][1:]; idx += 1
+            elif arg_upper in ['A', 'AAAA', 'MX', 'TXT', 'CNAME', 'NS', 'SOA', 'SRV', 'ANY']: qtype = arg_upper; idx += 1
+            else: break # Assume rest is part of name if not recognized? Risky. For now, stop here.
+    except ValueError as e: ui_manager.display_error(f"dig: {e}"); return NO_EXEC_MARKER + "dig failed", False
 
-def translate_wget_curl(cmd_name: str, args: list[str]) -> str | None:
+    cmd = f"Resolve-DnsName -Name {shlex.quote(name)} -Type {qtype} -CacheOnly:$false -DnsOnly"
+    if server: cmd += f" -Server {shlex.quote(server)}"
+    # Resolve-DnsName doesn't need elevation
+    return cmd, False
+
+def translate_wget_curl(cmd_name: str, args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog=cmd_name, add_help=False)
     parser.add_argument('-O', '--output-document', dest='output_file')
     parser.add_argument('-o', '--output', dest='output_file') # Common alias
     parser.add_argument('-L', '--location', action='store_true', help='Follow redirects (default in IWR)')
     parser.add_argument('-H', '--header', action='append', default=[], help='Add custom header (Key:Value)')
     parser.add_argument('-X', '--request', dest='method', default='GET', help='HTTP method (GET, POST, etc.)')
+    parser.add_argument('--insecure', '-k', action='store_true', help='Ignore SSL errors')
     parser.add_argument('url')
     try:
-        # Use parse_known_args for flexibility if unhandled args exist
         parsed_args, remaining_args = parser.parse_known_args(args)
         if remaining_args:
              ui_manager.display_warning(f"{cmd_name}: Ignoring unsupported arguments: {' '.join(remaining_args)}")
     except ValueError as e:
-        ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed"
+        ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed", False
 
     base_cmd = "Invoke-WebRequest"
     params = [f"-Uri {shlex.quote(parsed_args.url)}", f"-Method {parsed_args.method.upper()}"]
 
-    # IWR follows redirects by default, -L is implicit unless -MaximumRedirection 0 is set
+    if parsed_args.insecure:
+        params.append("-SkipCertificateCheck")
 
     if parsed_args.output_file:
         params.append(f"-OutFile {shlex.quote(parsed_args.output_file)}")
     else:
-        # Mimic curl default outputting to stdout? IWR outputs object.
-        # Use -UseBasicParsing to get content more directly? Or select content.
-        # Let's select content for now.
-        params.append("-UseBasicParsing") # Gets content more directly
+        params.append("-UseBasicParsing") # Gets content more directly for stdout
 
     if parsed_args.header:
         headers_dict = {}
@@ -689,6 +769,8 @@ def translate_wget_curl(cmd_name: str, args: list[str]) -> str | None:
             if ':' in h:
                 key, val = h.split(':', 1)
                 headers_dict[key.strip()] = val.strip()
+            else: # Handle flags like -H "HeaderOnly" - Needs thought, maybe ignore for now
+                pass
         if headers_dict:
              header_ps_str = "@{" + "; ".join([f'"{k}"="{v}"' for k,v in headers_dict.items()]) + "}"
              params.append(f"-Headers {header_ps_str}")
@@ -696,167 +778,194 @@ def translate_wget_curl(cmd_name: str, args: list[str]) -> str | None:
     # If no output file, pipe content to stdout
     post_cmd = ""
     if not parsed_args.output_file:
+        # IWR with UseBasicParsing puts content in $response.Content
+        # So we pipe the whole response object and expand content
         post_cmd = "| Select-Object -ExpandProperty Content"
 
-    return f"{base_cmd} {' '.join(params)} {post_cmd}"
+    full_cmd = f"{base_cmd} {' '.join(params)} {post_cmd}"
+    # Network requests don't need elevation
+    return full_cmd, False
 
-def translate_wget(args: list[str]) -> str | None: return translate_wget_curl('wget', args)
-def translate_curl(args: list[str]) -> str | None: return translate_wget_curl('curl', args)
+def translate_wget(args: list[str]) -> tuple[str | None, bool]: return translate_wget_curl('wget', args)
+def translate_curl(args: list[str]) -> tuple[str | None, bool]: return translate_wget_curl('curl', args)
 
 # === Package Management & OS ===
-def translate_apt(args: list[str]) -> str | None:
+def translate_apt(args: list[str]) -> tuple[str | None, bool]:
     # Assume the previous robust apt parser implementation is here...
-    # (Code omitted for brevity)
     parser = NonExitingArgumentParser(prog='apt/apt-get/dnf/yum/pacman/zypper', add_help=False); subparsers = parser.add_subparsers(dest='subcommand', help='Sub-command help')
     subparsers.add_parser('update'); upg = subparsers.add_parser('upgrade'); upg.add_argument('packages', nargs='*'); inst = subparsers.add_parser('install'); inst.add_argument('packages', nargs='+'); inst.add_argument('-y', '--yes', action='store_true'); rem = subparsers.add_parser('remove'); rem.add_argument('packages', nargs='+'); rem.add_argument('-y', '--yes', action='store_true'); purg = subparsers.add_parser('purge'); purg.add_argument('packages', nargs='+'); purg.add_argument('-y', '--yes', action='store_true'); srch = subparsers.add_parser('search'); srch.add_argument('query', nargs='+'); sh = subparsers.add_parser('show'); sh.add_argument('package')
-    # Add aliases used by other package managers if needed (e.g., 'install' vs 'add')
-    # pacman -S -> install
-    # zypper install -> install
-    cmd_name = parser.prog.split('/')[0] # Get original command name for messages/logic if needed
+    # Add aliases
+    aliases = {'add': 'install', '-S': 'install', 'delete': 'remove', 'erase': 'remove', 'list': 'list', 'info': 'show'} # Added list/info
 
-    # Basic mapping for pacman -S etc? Need smarter argument parsing.
-    # Simple approach: assume subcommand names match apt for now.
-    if cmd_name == 'pacman' and args and args[0] == '-S':
-        args = ['install'] + args[1:] # Map pacman -S to install
+    cmd_name = parser.prog.split('/')[0] # Get original command name
+
+    # Pre-process args for aliases like pacman -S etc.
+    processed_args = list(args) # Make a copy
+    if processed_args:
+        potential_alias = processed_args[0]
+        if potential_alias in aliases:
+            processed_args[0] = aliases[potential_alias] # Replace alias with standard subcommand
+        elif cmd_name == 'pacman' and potential_alias == '-Syu': # Handle common combo
+            processed_args = ['upgrade'] # Treat -Syu as upgrade --all
+        elif cmd_name == 'pacman' and potential_alias == '-S':
+            processed_args = ['install'] + processed_args[1:]
+        elif cmd_name == 'pacman' and potential_alias == '-R':
+            processed_args = ['remove'] + processed_args[1:]
+        elif cmd_name == 'pacman' and potential_alias == '-Ss':
+            processed_args = ['search'] + processed_args[1:]
+        # Add more specific mappings for other package managers if needed
 
     try:
-        # Handle case where args are empty or don't start with a known subcommand
-        if not args or args[0] not in subparsers.choices:
-            # Try common aliases?
-            if args and args[0] == 'list': subcmd_guess = 'list' # winget list
-            elif args and args[0] in ['add', '-S']: subcmd_guess = 'install' # Map add/-S to install
-            elif args and args[0] in ['delete', 'erase']: subcmd_guess = 'remove' # Map delete/erase to remove
-            else: subcmd_guess = args[0] if args else ''
-            # Map to winget equivalent if possible, else show help
-            if subcmd_guess == 'list': return "winget list"
-            ui_manager.display_error(f"{cmd_name}: Unknown or missing subcommand: '{subcmd_guess}'"); return "winget --help"
+        if not processed_args or processed_args[0] not in subparsers.choices and processed_args[0] != 'list': # Allow list as special case
+            subcmd_guess = processed_args[0] if processed_args else ''
+            ui_manager.display_error(f"{cmd_name}: Unknown or missing subcommand: '{subcmd_guess}'");
+            return "winget --help", False # Show winget help
+        # Handle 'list' command separately if needed, or add it to parser
+        if processed_args[0] == 'list':
+             # winget list doesn't usually need elevation
+             return "winget list", False
         # Proceed with parsing if subcommand is recognized
-        parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed"
+        parsed_args = parser.parse_args(processed_args)
+    except ValueError as e: ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed", False
 
     base_cmd="winget"; subcmd=parsed_args.subcommand; params=[]; accept=False
-    if subcmd == 'update': params.append("source update")
-    elif subcmd == 'upgrade': params.append("upgrade"); accept=getattr(parsed_args,'yes',False); (parsed_args.packages) and params.extend([shlex.quote(p) for p in parsed_args.packages]) or params.append("--all")
-    elif subcmd == 'install': params.append("install"); params.extend([shlex.quote(p) for p in parsed_args.packages]); accept=getattr(parsed_args,'yes',False)
-    elif subcmd in ['remove','purge']: params.append("uninstall"); params.extend([shlex.quote(p) for p in parsed_args.packages]); accept=getattr(parsed_args,'yes',False)
-    elif subcmd == 'search': params.append("search"); params.append(shlex.quote(" ".join(parsed_args.query)))
-    elif subcmd == 'show': params.append("show"); params.append(shlex.quote(parsed_args.package))
-    else: return f"winget {subcmd} # (Passthrough)"
+    needs_elevation = False # Default, most winget read commands are fine
+
+    if subcmd == 'update':
+        params.append("source update") # Updating sources might need elevation sometimes? Assume false for now.
+    elif subcmd == 'upgrade':
+        params.append("upgrade"); accept=getattr(parsed_args,'yes',False);
+        if parsed_args.packages: params.extend([shlex.quote(p) for p in parsed_args.packages])
+        else: params.append("--all")
+        needs_elevation = True # Upgrading packages needs elevation
+    elif subcmd == 'install':
+        params.append("install"); params.extend([shlex.quote(p) for p in parsed_args.packages]); accept=getattr(parsed_args,'yes',False)
+        needs_elevation = True # Installing packages needs elevation
+    elif subcmd in ['remove','purge']:
+        params.append("uninstall"); params.extend([shlex.quote(p) for p in parsed_args.packages]); accept=getattr(parsed_args,'yes',False)
+        needs_elevation = True # Uninstalling packages needs elevation
+    elif subcmd == 'search':
+        params.append("search"); params.append(shlex.quote(" ".join(parsed_args.query)))
+    elif subcmd == 'show':
+        params.append("show"); params.append(shlex.quote(parsed_args.package))
+    else:
+        # Should not be reached if parsing worked
+        return f"winget {subcmd} # (Passthrough)", False
+
     if accept: params.extend(["--accept-package-agreements", "--accept-source-agreements"])
-    return f"{base_cmd} {' '.join(params)}"
+
+    # Add verbose flag maybe?
+    params.append("--disable-interactivity") # Useful for scripting winget
+
+    return f"{base_cmd} {' '.join(params)}", needs_elevation
 
 
-def translate_do_release_upgrade_sim(args: list[str]) -> str | None:
-    """Simulates checking for/installing Windows Updates."""
-    ui_manager.display_info("Checking for Windows Updates using built-in COM object...")
-    # PowerShell commands to check, download, install updates
+# --- Update do_release_upgrade_sim to return tuple ---
+def translate_do_release_upgrade_sim(args: list[str]) -> tuple[str | None, bool]:
+    """Simulates checking for/installing Windows Updates. Installation requires elevation."""
     ps_check_cmd = """
-        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
-        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-        Write-Host "Searching for updates..."
+        $UpdateSession = New-Object -ComObject Microsoft.Update.Session;
+        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher();
+        Write-Host "Searching for updates...";
         try {
-            $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'") # Basic software updates
-            Write-Host ("Found " + $SearchResult.Updates.Count + " updates.")
-            return $SearchResult.Updates.Count # Return count to Python side if needed
+            $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'");
+            Write-Host ("Found " + $SearchResult.Updates.Count + " updates.");
+            return $SearchResult.Updates.Count;
         } catch {
-            Write-Warning "Failed to search for updates. Error: $($_.Exception.Message)"
-            return -1 # Indicate error
+            Write-Warning "Failed to search for updates. Error: $($_.Exception.Message)";
+            return -1;
         }
     """
     ps_install_cmd = """
-        $UpdateSession = New-Object -ComObject Microsoft.Update.Session
-        $UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-        $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'")
+        # Define the install logic within a ScriptBlock for Start-Process
+        # This whole block will be executed elevated.
+        $ErrorActionPreference = 'Stop'; # Exit script on error inside block
+        try {
+            $UpdateSession = New-Object -ComObject Microsoft.Update.Session;
+            $UpdateSearcher = $UpdateSession.CreateUpdateSearcher();
+            $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'");
 
-        if ($SearchResult.Updates.Count -eq 0) {
-            Write-Host "No updates to install."
-            exit 0
-        }
-
-        Write-Host "Updates to download:"
-        $UpdatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl
-        foreach ($update in $SearchResult.Updates) {
-            Write-Host ("  " + $update.Title)
-            $UpdatesToDownload.Add($update) | Out-Null
-        }
-
-        if ($UpdatesToDownload.Count -gt 0) {
-            Write-Host "Downloading updates..."
-            $Downloader = $UpdateSession.CreateUpdateDownloader()
-            $Downloader.Updates = $UpdatesToDownload
-            $DownloadResult = $Downloader.Download()
-
-            if ($DownloadResult.ResultCode -ne 2) { # 2 means Succeeded
-                Write-Error "Download failed. Result code: $($DownloadResult.ResultCode)"
-                exit 1
+            if ($SearchResult.Updates.Count -eq 0) {
+                Write-Host "No updates to install."; exit 0;
             }
-
-            Write-Host "Updates downloaded. Installing..."
-            $UpdatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+            Write-Host "Updates to download:";
+            $UpdatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl;
             foreach ($update in $SearchResult.Updates) {
-                 if ($update.IsDownloaded) { $UpdatesToInstall.Add($update) | Out-Null }
+                Write-Host ("  " + $update.Title);
+                $UpdatesToDownload.Add($update) | Out-Null;
             }
-
-            if ($UpdatesToInstall.Count -gt 0) {
-                 $Installer = $UpdateSession.CreateUpdateInstaller()
-                 $Installer.Updates = $UpdatesToInstall
-                 # Note: Installation might require reboot and take a long time.
-                 # This script runs synchronously. Consider async or just triggering install.
-                 $InstallResult = $Installer.Install()
-
-                 Write-Host ("Installation Result: " + $InstallResult.ResultCode) # 2 = Succeeded, 3 = Succeeded with errors, 4 = Failed, 5 = Canceled
-                 if ($InstallResult.RebootRequired) {
-                     Write-Warning "A reboot is required to complete the installation."
-                 }
-                 Write-Host "Installation process finished."
-                 exit $InstallResult.ResultCode # Return result code
-            } else {
-                 Write-Host "No updates were successfully downloaded to install."
-                 exit 0
-            }
-        } else {
-             Write-Host "No updates require downloading."
-             exit 0
+            if ($UpdatesToDownload.Count -gt 0) {
+                Write-Host "Downloading updates...";
+                $Downloader = $UpdateSession.CreateUpdateDownloader();
+                $Downloader.Updates = $UpdatesToDownload;
+                $DownloadResult = $Downloader.Download();
+                if ($DownloadResult.ResultCode -ne 2) { # 2 means Succeeded
+                    Write-Error "Download failed. Result code: $($DownloadResult.ResultCode)"; exit 1;
+                }
+                Write-Host "Updates downloaded. Installing...";
+                $UpdatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
+                foreach ($update in $SearchResult.Updates) {
+                    if ($update.IsDownloaded) { $UpdatesToInstall.Add($update) | Out-Null }
+                }
+                if ($UpdatesToInstall.Count -gt 0) {
+                    $Installer = $UpdateSession.CreateUpdateInstaller();
+                    $Installer.Updates = $UpdatesToInstall;
+                    # Note: Installation might require reboot and take a long time.
+                    $InstallResult = $Installer.Install();
+                    Write-Host ("Installation Result: " + $InstallResult.ResultCode); # 2=OK, 3=OK_Reboot, 4=Fail, 5=Cancel
+                    if ($InstallResult.RebootRequired) {
+                        Write-Warning "A reboot is required to complete the installation.";
+                    }
+                    Write-Host "Installation process finished.";
+                    exit $InstallResult.ResultCode; # Return result code
+                } else {
+                    Write-Host "No updates were successfully downloaded to install."; exit 0;
+                }
+            } else { Write-Host "No updates require downloading."; exit 0; }
+        } catch {
+            Write-Error "An error occurred during update installation: $($_.Exception.Message)";
+            exit 1; # Indicate failure
         }
+        # Add a pause if running interactively to see output
+        # Read-Host -Prompt "Press Enter to close window"
     """
 
-    stdout, stderr, code = _run_powershell_command(ps_check_cmd)
+    ui_manager.display_info("Checking for Windows Updates using built-in COM object...")
+    stdout, stderr, code = _run_powershell_command(ps_check_cmd) # Check runs non-elevated
     update_count = -1
     if code == 0 and stdout:
-        ui_manager.display_output(stdout, stderr)
+        # ui_manager.display_output(stdout, stderr) # Output is noisy, just use parsed count
         try:
-            # Extract count if possible (simple approach)
             match = re.search(r'Found (\d+) updates', stdout)
             if match: update_count = int(match.group(1))
-        except Exception: pass # Ignore parsing errors
+            else: # Handle case where PS returns only the number
+                 if stdout.strip().isdigit(): update_count = int(stdout.strip())
+        except Exception: pass
     elif stderr:
         ui_manager.display_error(f"Update check failed: {stderr}")
-        return NO_EXEC_MARKER + "update check failed"
+        return NO_EXEC_MARKER + "update check failed", False
+
+    needs_elevation = False
+    return_marker = NO_EXEC_MARKER + "update check finished"
 
     if update_count > 0:
-        install = ui_manager.console.input(f"[bold yellow]{update_count} updates found. Do you want to attempt installation? (y/N): [/bold yellow]")
+        install = ui_manager.console.input(f"[bold yellow]{update_count} updates found. Do you want to attempt installation? (Requires Admin) (y/N): [/bold yellow]")
         if install.lower() == 'y':
-            ui_manager.display_info("Attempting to download and install updates via PowerShell...")
-            ui_manager.display_warning("This may take a long time and might require a reboot.")
-            # Run the install script (this will block Swodnil until done)
-            stdout_inst, stderr_inst, code_inst = _run_powershell_command(ps_install_cmd)
-            if stdout_inst: ui_manager.display_output(stdout_inst, None)
-            if stderr_inst: ui_manager.display_output(None, stderr_inst)
-            if code_inst != 0 and code_inst != 2: # Allow success code 2
-                 ui_manager.display_error(f"Update installation finished with errors or failure (Code: {code_inst}).")
-            else:
-                 ui_manager.display_info("Update installation process completed.")
+            ui_manager.display_info("Attempting to install updates via elevated PowerShell...")
+            ui_manager.display_warning("A UAC prompt will appear. Output will be in a separate window.")
+            # Return the install script and signal elevation needed
+            return ps_install_cmd, True
         else:
             ui_manager.display_info("Update installation cancelled.")
+            return return_marker, False # No elevation needed for cancel
     elif update_count == 0:
         ui_manager.display_info("System is up-to-date.")
-    # else: Error occurred during check
+    # else: Error occurred during check, handled above
 
-    return NO_EXEC_MARKER + "update check finished" # Don't execute anything else
-
+    return return_marker, needs_elevation # Return tuple
 
 # === User Management ===
-def translate_passwd_guide(args: list[str]) -> str | None:
+def translate_passwd_guide(args: list[str]) -> tuple[str | None, bool]:
     """Guides the user to change password securely."""
     ui_manager.display_warning("Swodnil cannot securely change passwords directly.")
     ui_manager.display_info("To change your password:")
@@ -866,33 +975,71 @@ def translate_passwd_guide(args: list[str]) -> str | None:
     ui_manager.console.print(f"    [cyan]net user {username} *[/cyan]")
     ui_manager.display_info("    (You will be prompted to enter the new password securely).")
 
-    # Optionally, try to launch an elevated cmd for the user
-    # try_launch = ui_manager.console.input("Do you want to try launching an elevated command prompt now? (y/N): ")
-    # if try_launch.lower() == 'y':
-    #     cmd_to_run = f'cmd /c "net user {username} * & pause"'
-    #     elevate_cmd = f'powershell -Command "Start-Process cmd -ArgumentList \'/c net user {username} * & pause\' -Verb RunAs"'
-    #     ui_manager.display_info("Attempting to request Administrator privileges...")
-    #     stdout, stderr, code = _run_powershell_command(elevate_cmd)
-    #     if code != 0:
-    #         ui_manager.display_error(f"Failed to launch elevated prompt: {stderr}")
-
-    return NO_EXEC_MARKER + "passwd guide shown"
-
+    # Don't attempt to elevate for the guide itself
+    return NO_EXEC_MARKER + "passwd guide shown", False
 
 # === Shell Internals / Environment ===
-def translate_env_printenv(args: list[str]) -> str | None:
+def translate_env_printenv(args: list[str]) -> tuple[str | None, bool]:
     """Translates env/printenv to display current environment."""
-    # This should ideally be handled by shell_core displaying its managed environment.
-    # For now, fallback to Get-ChildItem Env:
-    return "Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize Name,Value"
+    # Use shell_environment from shell_core ideally, but fallback to PS
+    return "Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize Name,Value", False
 
-def translate_clear(args: list[str]) -> str | None:
-    if args: ui_manager.display_error("clear: does not support arguments."); return NO_EXEC_MARKER + "clear failed"
-    return "Clear-Host"
+def translate_clear(args: list[str]) -> tuple[str | None, bool]:
+    if args: ui_manager.display_error("clear: does not support arguments."); return NO_EXEC_MARKER + "clear failed", False
+    return "Clear-Host", False
 
-# === Simulated Commands ===
-def translate_neofetch_simulated(args: list[str]) -> str | None:
-    if not psutil: ui_manager.display_error("Neofetch requires 'psutil': pip install psutil"); return NO_EXEC_MARKER+"neofetch failed"
+# === Simulated Commands (Ensure they return tuple) ===
+# --- Neofetch Simulation Helpers (Placeholders/Simple Implementations) ---
+def _get_uptime() -> str:
+    if not psutil: return "N/A (psutil missing)"
+    try:
+        boot_time_timestamp = psutil.boot_time()
+        elapsed_seconds = time.time() - boot_time_timestamp
+        td = datetime.timedelta(seconds=elapsed_seconds)
+        days = td.days
+        hours, remainder = divmod(td.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = ""
+        if days > 0: uptime_str += f"{days} day{'s' if days > 1 else ''}, "
+        uptime_str += f"{hours:02}:{minutes:02}:{seconds:02}"
+        return uptime_str.strip(', ')
+    except Exception as e:
+        return f"N/A (Error: {e})"
+
+def _get_package_count() -> str:
+     stdout, stderr, code = _run_powershell_command("winget list | Measure-Object")
+     if code == 0 and stdout:
+         match = re.search(r'Count\s+:\s+(\d+)', stdout)
+         if match:
+             return f"{match.group(1)} (winget)"
+     return "N/A" # Fallback
+
+def _get_gpu_info() -> str:
+     stdout, stderr, code = _run_powershell_command("(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue).Name")
+     if code == 0 and stdout:
+         return stdout.splitlines()[0].strip() if stdout.strip() else "N/A"
+     return "N/A" # Fallback
+
+def _get_pending_updates_count() -> int:
+     ps_check_cmd = """
+        try {
+            $UpdateSession = New-Object -ComObject Microsoft.Update.Session;
+            $UpdateSearcher = $UpdateSession.CreateUpdateSearcher();
+            $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'");
+            return $SearchResult.Updates.Count;
+        } catch { return -1 }
+     """
+     stdout, stderr, code = _run_powershell_command(ps_check_cmd)
+     if code == 0 and stdout and stdout.strip().isdigit():
+         return int(stdout.strip())
+     return -1 # Indicate error
+
+def translate_neofetch_simulated(args: list[str]) -> tuple[str | None, bool]:
+    # ... (neofetch simulation logic using helpers - unchanged) ...
+    # ... MAKE SURE IT RETURNS SIMULATION MARKER and False for elevation ...
+    if not psutil: ui_manager.display_error("Neofetch simulation requires 'psutil': pip install psutil"); return NO_EXEC_MARKER+"neofetch failed", False
+    # ... (rest of the info gathering logic) ...
+    # Example from previous step:
     ui_manager.console.print("\n[bold cyan]Swodnil System Info:[/bold cyan]")
     logo = ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"]; logo_color = "magenta"
     info = {}
@@ -901,23 +1048,31 @@ def translate_neofetch_simulated(args: list[str]) -> str | None:
     try: info['OS'] = f"{platform.system()} {platform.release()} ({platform.version()})"
     except Exception: info['OS'] = "N/A"
     try: info['Uptime'] = _get_uptime() # Use helper
-    except Exception: info['Uptime'] = "N/A"
+    except Exception as e: info['Uptime'] = f"N/A (Err:{e})"
     try: info['Packages'] = _get_package_count() # Use helper
-    except Exception: info['Packages'] = "N/A"
-    try: info['Terminal'] = f"Swodnil 0.2 (PID:{os.getpid()})" # Increment version :)
+    except Exception as e: info['Packages'] = f"N/A (Err:{e})"
+    try: info['Terminal'] = f"Swodnil (PID:{os.getpid()})" # Removed version for simplicity
     except Exception: info['Terminal'] = "N/A"
     try: info['CPU'] = platform.processor()
     except Exception: info['CPU'] = "N/A"
     try: info['GPU'] = _get_gpu_info() # Use helper
-    except Exception: info['GPU'] = "N/A"
+    except Exception as e: info['GPU'] = f"N/A (Err:{e})"
     try: mem = psutil.virtual_memory(); info['Memory'] = f"{_format_bytes(mem.used)} / {_format_bytes(mem.total)} ({mem.percent}%)"
-    except Exception: info['Memory'] = "N/A"
-    try: disk = psutil.disk_usage('C:'); info['Storage(C:)'] = f"{_format_bytes(disk.used)} / {_format_bytes(disk.total)} ({disk.percent}%)"
-    except Exception: info['Storage(C:)'] = "N/A"
-    try: updates = _get_pending_updates_count(); info['Updates'] = f"[yellow]{updates} Pending[/yellow]" if updates > 0 else "No"
-    except Exception: info['Updates'] = "N/A"
+    except Exception as e: info['Memory'] = f"N/A (Err:{e})"
+    try:
+        drive_letter = os.path.splitdrive(os.getcwd())[0] or 'C:' # Use current drive or default to C:
+        if not drive_letter.endswith('\\'): drive_letter += '\\'
+        disk = psutil.disk_usage(drive_letter)
+        info[f'Storage({drive_letter})'] = f"{_format_bytes(disk.used)} / {_format_bytes(disk.total)} ({disk.percent}%)"
+    except Exception as e: info[f'Storage({drive_letter})'] = f"N/A (Err:{e})" # Use drive letter determined above
+    try:
+        updates_count = _get_pending_updates_count() # Use helper
+        if updates_count > 0: info['Updates'] = f"[yellow]{updates_count} Pending[/yellow]"
+        elif updates_count == 0: info['Updates'] = "System up-to-date"
+        else: info['Updates'] = "[dim]N/A (Check failed)[/dim]"
+    except Exception as e: info['Updates'] = f"N/A (Err:{e})"
 
-    max_key_len = max(len(k) for k in info.keys()); output_lines = []
+    max_key_len = max(len(k) for k in info.keys()) if info else 0; output_lines = []
     info_items = list(info.items())
     for i in range(max(len(logo), len(info))):
         logo_part = f"[{logo_color}]{logo[i]}[/{logo_color}]" if i < len(logo) else " " * len(logo[0])
@@ -925,13 +1080,16 @@ def translate_neofetch_simulated(args: list[str]) -> str | None:
         if i < len(info_items): key, value = info_items[i]; info_part = f"[{key_color}]{key.rjust(max_key_len)}[/]: {value}"
         output_lines.append(f" {logo_part}  {info_part}")
     ui_manager.console.print("\n".join(output_lines)); ui_manager.console.print()
-    return SIMULATION_MARKER_PREFIX + "neofetch" # Return simulation marker
 
-def translate_cowsay_simulated(args: list[str]) -> str | None:
+    return SIMULATION_MARKER_PREFIX + "neofetch", False
+
+def translate_cowsay_simulated(args: list[str]) -> tuple[str | None, bool]:
+    # ... (cowsay simulation logic - unchanged) ...
     message = " ".join(args) if args else "Moo?"; max_width = 40
     lines = textwrap.wrap(message, width=max_width); bubble_width = max(len(line) for line in lines) if lines else 0
     bubble = [" " + "_" * (bubble_width + 2)];
-    if len(lines) == 1: bubble.append(f"< {lines[0].ljust(bubble_width)} >")
+    if not lines: bubble.append("< >")
+    elif len(lines) == 1: bubble.append(f"< {lines[0].ljust(bubble_width)} >")
     else: bubble.append(f"/ {lines[0].ljust(bubble_width)} \\"); bubble.extend([f"| {lines[i].ljust(bubble_width)} |" for i in range(1, len(lines)-1)]); bubble.append(f"\\ {lines[-1].ljust(bubble_width)} /")
     bubble.append(" " + "-" * (bubble_width + 2)); cow = r"""
         \   ^__^
@@ -940,41 +1098,25 @@ def translate_cowsay_simulated(args: list[str]) -> str | None:
                 ||----w |
                 ||     ||"""
     ui_manager.console.print("\n".join(bubble) + cow)
-    return SIMULATION_MARKER_PREFIX + "cowsay"
+    return SIMULATION_MARKER_PREFIX + "cowsay", False
 
-def translate_logangsay_simulated(args: list[str]) -> str | None:
-    """Displays a message with custom Logan ASCII art."""
-    message = " ".join(args) if args else "Yo!" # Changed default message
-    max_width = 40 # Keep consistent with cowsay bubble width or adjust as needed
-
-    # --- Speech Bubble Logic (same as cowsay) ---
+def translate_logangsay_simulated(args: list[str]) -> tuple[str | None, bool]:
+    # ... (logansay simulation logic - unchanged) ...
+    message = " ".join(args) if args else "Yo!"
+    max_width = 40
     lines = textwrap.wrap(message, width=max_width)
     bubble_width = max(len(line) for line in lines) if lines else 0
-
-    bubble = [" " + "_" * (bubble_width + 2)] # Top border
-
-    if not lines: # Handle empty message case explicitly
-        bubble.append("< >")
-    elif len(lines) == 1:
-        # Single line message
-        bubble.append(f"< {lines[0].ljust(bubble_width)} >")
-    else:
-        # Multi-line message
-        bubble.append(f"/ {lines[0].ljust(bubble_width)} \\") # Top line
-        bubble.extend([f"| {lines[i].ljust(bubble_width)} |" for i in range(1, len(lines)-1)]) # Middle lines
-        bubble.append(f"\\ {lines[-1].ljust(bubble_width)} /") # Bottom line
-
-    bubble.append(" " + "-" * (bubble_width + 2)) # Bottom border
-    # --- End Speech Bubble Logic ---
-
-    # Print the bubble, then the custom art
+    bubble = [" " + "_" * (bubble_width + 2)]
+    if not lines: bubble.append("< >")
+    elif len(lines) == 1: bubble.append(f"< {lines[0].ljust(bubble_width)} >")
+    else: bubble.append(f"/ {lines[0].ljust(bubble_width)} \\"); bubble.extend([f"| {lines[i].ljust(bubble_width)} |" for i in range(1, len(lines)-1)]); bubble.append(f"\\ {lines[-1].ljust(bubble_width)} /")
+    bubble.append(" " + "-" * (bubble_width + 2))
     ui_manager.console.print("\n".join(bubble))
-    ui_manager.console.print(LOGAN_ART) # Use the custom art defined above
+    ui_manager.console.print(LOGAN_ART)
+    return SIMULATION_MARKER_PREFIX + "logangsay", False
 
-    # Return the simulation marker for logangsay
-    return SIMULATION_MARKER_PREFIX + "logangsay"
 
-def translate_hollywood_simulated(args: list[str]) -> str | None:
+def translate_hollywood_simulated(args: list[str]) -> tuple[str | None, bool]:
     ui_manager.console.print("[green]Entering Hollywood Mode... Press Ctrl+C to exit.[/green]"); time.sleep(0.5)
     chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{};:'\",<.>/?\\|`~ "
     try:
@@ -982,12 +1124,34 @@ def translate_hollywood_simulated(args: list[str]) -> str | None:
              while True:
                 line = "".join(random.choices(chars, k=random.randint(40, ui_manager.console.width - 1)))
                 color = random.choice(["green", "bright_green", "dim green", "rgb(0,100,0)", "rgb(0,150,0)"])
-                ui_manager.console.print(f"[{color}]{line}", end='\n' if random.random() < 0.05 else '') # Occasionally add newline
+                ui_manager.console.print(f"[{color}]{line}", end='\n' if random.random() < 0.05 else '')
                 time.sleep(random.uniform(0.005, 0.02))
     except KeyboardInterrupt: ui_manager.console.print("\n[green]...Exiting Hollywood Mode.[/green]")
-    return SIMULATION_MARKER_PREFIX + "hollywood"
+    return SIMULATION_MARKER_PREFIX + "hollywood", False
+
+# --- Add translate_which and translate_command returning tuple ---
+def translate_which(args: list[str]) -> tuple[str | None, bool]:
+    """Translates which to Get-Command."""
+    if not args:
+        ui_manager.display_error("which: missing command name")
+        return NO_EXEC_MARKER + "which failed", False
+    command_name = shlex.quote(args[0])
+    return f"Get-Command {command_name} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source", False
+
+def translate_command(args: list[str]) -> tuple[str | None, bool]:
+    """Handles specific 'command' subcommands like 'command -v'."""
+    if args and args[0] == '-v':
+        if len(args) > 1:
+            return translate_which(args[1:])
+        else:
+            ui_manager.display_error("command -v: missing command name")
+            return NO_EXEC_MARKER + "command -v failed", False
+    else:
+        ui_manager.display_warning(f"command: Unsupported arguments {' '.join(args)}. Treating as native.")
+        return None, False # Let shell_core handle it natively
 
 # --- Command Map ---
+# Ensure all values are functions defined above that return the tuple (str|None, bool)
 TRANSLATION_MAP = {
     # Filesystem
     "ls": translate_ls, "cp": translate_cp, "mv": translate_mv, "rm": translate_rm,
@@ -998,8 +1162,8 @@ TRANSLATION_MAP = {
     "cat": translate_cat, "grep": translate_grep, "head": translate_head, "tail": translate_tail,
     # System Info / Process Mgmt
     "hostname": translate_hostname, "uname": translate_uname, "ps": translate_ps,
-    "kill": translate_kill, "killall": translate_kill, # Map killall to kill translator
-    "top": translate_top, # Static snapshot
+    "kill": translate_kill, "killall": translate_kill,
+    "top": translate_top,
     "id": translate_id,
     # Network
     "ifconfig": translate_ifconfig, "whois": translate_whois, "dig": translate_dig,
@@ -1013,76 +1177,95 @@ TRANSLATION_MAP = {
     # User Management (Guide)
     "passwd": translate_passwd_guide,
     # OS Updates (Simulation)
-    "apt do-release-upgrade": translate_do_release_upgrade_sim, # Simulate standard updates
+    "do-release-upgrade": translate_do_release_upgrade_sim,
     # Simulated Fun Commands
     "neofetch": translate_neofetch_simulated,
     "cowsay": translate_cowsay_simulated,
     "logangsay": translate_logangsay_simulated,
     "hollywood": translate_hollywood_simulated,
+    # Which/command -v support
+    "which": translate_which,
+    "command": translate_command,
 }
 
-# --- Main Processing Function ---
-def process_command(command: str, args: list[str]) -> str | None:
-    """ Main entry point for command translation/simulation. """
-    cmd_lower = command.lower()
-    # Handle specific case 'command -v' -> 'which'
-    if cmd_lower == "command" and args and args[0] == "-v":
-        handler = TRANSLATION_MAP.get("which")
-        if handler and len(args) > 1: return handler(args[1:])
-        else: ui_manager.display_error("command -v: missing command name"); return NO_EXEC_MARKER + "cmd -v failed"
 
+# --- Main Processing Function ---
+# Updated to handle and return tuple
+def process_command(command: str, args: list[str]) -> tuple[str | None, bool]:
+    """
+    Main entry point for command translation/simulation.
+    Returns a tuple: (result_string | None, needs_elevation: bool)
+    """
+    cmd_lower = command.lower()
     handler = TRANSLATION_MAP.get(cmd_lower)
+    needs_elevation = False # Default to False
+
     if handler:
         try:
-            result = handler(args) # Returns PowerShell string, SIMULATION_*, NO_EXEC_*, or None on internal error
-            return result
+            # Expect handler to return (result, needs_elevation) tuple
+            handler_output = handler(args)
+
+            # Validate the output type
+            if isinstance(handler_output, tuple) and len(handler_output) == 2 and isinstance(handler_output[1], bool):
+                result, needs_elevation = handler_output
+                # Further check if result is string or None
+                if not (isinstance(result, str) or result is None):
+                     ui_manager.display_error(f"Internal error: Translator for '{command}' returned invalid result type: {type(result)}")
+                     return NO_EXEC_MARKER + "handler type error", False
+            else:
+                # Handle legacy translators or error case where handler didn't return the expected tuple
+                ui_manager.display_warning(f"Internal warning: Translator for '{command}' did not return expected (result, bool) tuple. Got: {type(handler_output)}. Assuming no elevation needed.")
+                result = str(handler_output) if handler_output is not None else None # Attempt conversion
+                needs_elevation = False
+
+            return result, needs_elevation
         except Exception as e:
             ui_manager.display_error(f"Internal Swodnil error processing '{command}': {e}")
-            # import traceback; traceback.print_exc() # Uncomment for debugging tracebacks
-            return NO_EXEC_MARKER + "handler exception" # Prevent execution on internal error
+            import traceback; traceback.print_exc() # More debugging info
+            return NO_EXEC_MARKER + "handler exception", False # Return tuple on error
     else:
-        # Command not found in map -> treat as native
-        return None
+        # Command not found in map -> treat as native, no elevation needed by default
+        return None, False # Return tuple
 
 # --- Direct Execution Test Block ---
 if __name__ == "__main__":
-    # Example tests - more can be added
+    # Example tests - adjust as needed
     test_commands = [
         "ls -lart", "cp -r source dest", "rm -rf testdir", "mkdir -p a/b/c", "find . -name '*.py'",
         "grep -i error log.txt", "head -n 5 file", "tail -f log", "hostname", "uname -a",
         "ps aux", "kill 1234", "killall notepad", "df -h", "apt install vscode -y", "dnf update",
-        "pacman -S vim", "passwd", "apt do-release-upgrade", "neofetch", "cowsay test 123"
+        "pacman -S vim", "passwd", "do-release-upgrade", "neofetch", "cowsay test 123", "logangsay hi",
+        "hollywood", "cat /etc/fstab", "cat /proc/cpuinfo", "which ls", "command -v grep"
     ]
     # Set up console for testing
     if not hasattr(ui_manager, 'console') or ui_manager.console is None:
          from rich.console import Console
          ui_manager.console = Console()
 
-    print("--- Running Translator Tests ---")
+    print("--- Running Translator Tests (Output: Tuple(Result, NeedsElevation)) ---")
     for cmd_str in test_commands:
         print("-" * 20); print(f"Testing: {cmd_str}")
         parts = shlex.split(cmd_str) if cmd_str else [""]
         command = parts[0] if parts else ""
         if not command: continue
         args_list = parts[1:]
-        result = process_command(command, args_list)
-        print(f"  Result: {result}")
-        if isinstance(result, str) and result.startswith(SIMULATION_MARKER_PREFIX):
-            print("  -> Simulation Triggered")
-        elif isinstance(result, str) and result.startswith(NO_EXEC_MARKER):
-            print("  -> Execution Blocked")
-        elif isinstance(result, str):
-            print("  -> PowerShell Command Generated")
-        elif result is None and command.lower() not in TRANSLATION_MAP:
-            print("  -> Native Command")
+        result_tuple = process_command(command, args_list)
+        print(f"  Result Tuple: {result_tuple}")
+        if isinstance(result_tuple, tuple) and len(result_tuple)==2:
+            result, needs_elevation = result_tuple
+            print(f"  Needs Elevation: {needs_elevation}")
+            if isinstance(result, str) and result.startswith(SIMULATION_MARKER_PREFIX): print("  -> Simulation Triggered")
+            elif isinstance(result, str) and result.startswith(NO_EXEC_MARKER): print("  -> Execution Blocked")
+            elif isinstance(result, str): print("  -> PowerShell Command Generated")
+            elif result is None and command.lower() not in TRANSLATION_MAP: print("  -> Native Command")
+            else: print("  -> Translation/Simulation Failed or Unexpected Result")
         else:
-            print("  -> Translation/Simulation Failed or Unexpected Result")
-
+             print("  -> ERROR: process_command did not return expected tuple")
 # --- Special Path Mappings for 'cat' ---
 # Maps lowercase Linux paths to PowerShell commands providing equivalent info
 SPECIAL_CAT_PATHS = {
     # Filesystem Table Equivalent (/etc/fstab)
-    "/etc/fstab": r"""
+    "/etc/fstab": (r"""
         Write-Host '# Windows Volume Information (Simulated /etc/fstab)' -ForegroundColor Gray;
         Write-Host '# <file system>                              <mount point>   <type>     <options>       <dump> <pass>';
 
@@ -1118,13 +1301,13 @@ SPECIAL_CAT_PATHS = {
              $pass = 0;
              Write-Host ("{0,-45} {1,-15} {2,-10} {3,-15} {4} {5}" -f $fs, $mp, $type, $options, $dump, $pass);
         }
-    """,
+    """, True),
 
     # Hosts File (Actual Path) - Remains the same, shows real content
-    "/etc/hosts": r'Get-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts"',
+    "/etc/hosts": (r'Get-Content -Path "$env:SystemRoot\System32\drivers\etc\hosts"', False),
 
     # DNS Resolver Info (/etc/resolv.conf)
-    "/etc/resolv.conf": r"""
+    "/etc/resolv.conf": (r"""
         Write-Host '# Windows DNS Configuration (Simulated /etc/resolv.conf)' -ForegroundColor Gray;
         # Get search list per interface (often empty on clients)
         Get-DnsClient | Select-Object -ExpandProperty ConnectionSpecificSuffix | Where-Object {$_} | ForEach-Object {
@@ -1139,10 +1322,10 @@ SPECIAL_CAT_PATHS = {
             Write-Host ("# Interface $($_.InterfaceAlias) ($($_.InterfaceIndex))" -ForegroundColor Gray);
             $_.ServerAddresses | ForEach-Object { Write-Host "nameserver $_" };
         }
-    """,
+    """, False),
 
     # CPU Info (/proc/cpuinfo)
-    "/proc/cpuinfo": r"""
+    "/proc/cpuinfo": (r"""
         Write-Host '# Windows CPU Information (Simulated /proc/cpuinfo)' -ForegroundColor Gray;
         $processors = Get-CimInstance Win32_Processor;
         $processorIndex = 0;
@@ -1165,10 +1348,10 @@ SPECIAL_CAT_PATHS = {
             Write-Host ""; # Separator between processors
             $processorIndex++;
         }
-    """,
+    """, True),
 
     # Memory Info (/proc/meminfo)
-    "/proc/meminfo": r"""
+    "/proc/meminfo": (r"""
         Write-Host '# Windows Memory Information (Simulated /proc/meminfo)' -ForegroundColor Gray;
         $mem = Get-CimInstance Win32_OperatingSystem;
         $cs = Get-CimInstance Win32_ComputerSystem;
@@ -1193,10 +1376,10 @@ SPECIAL_CAT_PATHS = {
         Write-Host ("Buffers:`t{0,10} kB" -f 0); # Not directly equivalent/easily obtained
         Write-Host ("Cached:`t`t{0,10} kB" -f 0); # System Cache is complex, Get-Counter '\Memory\Cache Bytes' exists
         Write-Host ("Slab:`t`t{0,10} kB" -f 0); # N/A
-    """,
+    """, False),
 
     # OS / Distribution Info (/etc/os-release)
-    "/etc/os-release": r"""
+    "/etc/os-release": (r"""
         Write-Host '# Windows OS Information (Simulated /etc/os-release)' -ForegroundColor Gray;
         $os = Get-CimInstance Win32_OperatingSystem;
         $ci = Get-ComputerInfo; # Get-ComputerInfo is slower but provides more structured info
@@ -1216,8 +1399,8 @@ SPECIAL_CAT_PATHS = {
         Write-Host ("HOME_URL=`"https://www.microsoft.com/windows/`"");
         Write-Host ("SUPPORT_URL=`"https://support.microsoft.com/windows`"");
         Write-Host ("BUG_REPORT_URL=`"https://support.microsoft.com/windows`"");
-    """,
-    "/etc/lsb-release": r"""
+    """, False),
+    "/etc/lsb-release": (r"""
         Write-Host '# Windows OS Information (Simulated /etc/lsb-release)' -ForegroundColor Gray;
         $os = Get-CimInstance Win32_OperatingSystem;
         $name = $os.Caption;
@@ -1229,10 +1412,10 @@ SPECIAL_CAT_PATHS = {
         Write-Host ("DISTRIB_RELEASE={0}" -f $os.Version);
         Write-Host ("DISTRIB_CODENAME=Windows"); # Placeholder
         Write-Host ("DISTRIB_DESCRIPTION=`"{0}`"" -f $name);
-    """,
+    """, False),
 
     # User Info (/etc/passwd) - Guide remains best approach due to complexity/security
-    "/etc/passwd": "'# Showing current user info via whoami. For full user list use: Get-LocalUser' -ForegroundColor Gray; whoami /user /fo list",
+    "/etc/passwd": ("'# Showing current user info via whoami. For full user list use: Get-LocalUser' -ForegroundColor Gray; whoami /user /fo list", False),
     # Group Info (/etc/group) - Guide remains best approach
-    "/etc/group": "'# Showing current user groups via whoami. For full group list use: Get-LocalGroup' -ForegroundColor Gray; whoami /groups /fo list",
+    "/etc/group": ("'# Showing current user groups via whoami. For full group list use: Get-LocalGroup' -ForegroundColor Gray; whoami /groups /fo list", False),
 }

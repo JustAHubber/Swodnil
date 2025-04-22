@@ -4,6 +4,7 @@
 import os
 from rich.console import Console
 from rich.table import Table
+from rich.panel import Panel
 import pyfiglet
 
 # Initialize the Rich Console globally
@@ -21,6 +22,90 @@ def display_startup():
 
     console.print("[cyan]Welcome to Swodnil - Linux commands on Windows![/cyan]")
     console.print("[dim]Type 'exit' or 'quit' to leave.[/dim]\n")
+
+def display_help_page():
+    """Displays the custom Swodnil help page."""
+    console.print() # Add spacing before the help page
+    console.print(Panel(
+        "[bold red]Welcome to Swodnil![/]\n\n"
+        "A command-line interface providing a Linux-like experience on Windows.\n"
+        "It translates many common Linux commands and flags into their PowerShell equivalents.",
+        "I am open to suggestions!",
+        title="Swodnil Help",
+        border_style="magenta",
+        expand=False
+    ))
+    console.print()
+
+    # --- Built-in Commands ---
+    builtins_table = Table(
+        title="[bold magenta]Built-in Shell Commands[/]",
+        show_header=True,
+        header_style="bold blue",
+        border_style="dim"
+    )
+    builtins_table.add_column("Command", style="cyan", width=25)
+    builtins_table.add_column("Description")
+
+    builtins_table.add_row("help", "Display this help message.")
+    builtins_table.add_row("cd [directory]", "Change the current working directory (use '~' for home).")
+    builtins_table.add_row("exit | quit", "Terminate the Swodnil shell session.")
+    builtins_table.add_row("history", "Show the command history for the current session.")
+    builtins_table.add_row("alias", "List all defined command aliases.")
+    builtins_table.add_row("alias name='command'", "Define a new command alias.")
+    builtins_table.add_row("unalias name", "Remove a previously defined alias.")
+    builtins_table.add_row("export NAME=VALUE", "Set an environment variable for Swodnil and its child processes.")
+    builtins_table.add_row("unset NAME", "Remove an environment variable.")
+
+    console.print(builtins_table)
+    console.print()
+
+    # --- Translated Commands Examples ---
+    translated_table = Table(
+        title="[bold magenta]Common Translated Commands (Examples)[/]",
+        show_header=True,
+        header_style="bold blue",
+        border_style="dim"
+    )
+    translated_table.add_column("Linux Command(s)", style="cyan", width=25)
+    translated_table.add_column("Purpose / Windows Equivalent")
+
+    translated_table.add_row("ls, dir", "List directory contents (uses [dim]Get-ChildItem[/]).")
+    translated_table.add_row("cp", "Copy files/directories (uses [dim]Copy-Item[/]).")
+    translated_table.add_row("mv", "Move/rename files/directories (uses [dim]Move-Item[/]).")
+    translated_table.add_row("rm, del", "Remove files/directories (uses [dim]Remove-Item[/]).")
+    translated_table.add_row("mkdir", "Create directories (uses [dim]New-Item[/]).")
+    translated_table.add_row("cat", "Display file content (uses [dim]Get-Content[/]; special handling for paths like /etc/fstab, /proc/cpuinfo).")
+    translated_table.add_row("grep", "Search text using patterns (uses [dim]Select-String[/]).")
+    translated_table.add_row("pwd", "Print current working directory.")
+    translated_table.add_row("clear", "Clear the terminal screen (uses [dim]Clear-Host[/]).")
+    translated_table.add_row("wget, curl", "Download files from the web (uses [dim]Invoke-WebRequest[/]).")
+    translated_table.add_row("ps", "List running processes (uses [dim]Get-Process[/]).")
+    translated_table.add_row("kill, killall", "Terminate processes (uses [dim]Stop-Process[/]; may need elevation).")
+    translated_table.add_row("df", "Show disk space usage (uses [dim]Get-PSDrive[/] or [dim]Get-Volume[/]).")
+    translated_table.add_row("apt, yum, dnf, pacman, zypper", "Manage software packages (uses [dim]winget[/]; install/upgrade/remove need elevation).")
+    translated_table.add_row("hostname", "Show the computer name.")
+    translated_table.add_row("which, command -v", "Locate a command (uses [dim]Get-Command[/]).")
+    # Add more key examples if desired
+
+    console.print(translated_table)
+    console.print("\n[italic]Note: This is not an exhaustive list. Many other commands and flags are translated or passed to PowerShell.[/italic]\n")
+
+    # --- General Info ---
+    console.print(Panel(
+        "[bold]How Translation Works:[/]\n"
+        "- Swodnil intercepts commands and checks its internal map.\n"
+        "- If a match is found (e.g., 'ls -l'), it constructs the equivalent PowerShell command (e.g., 'Get-ChildItem | Format-Table ...').\n"
+        "- If no specific translation exists, the command is passed directly to PowerShell for execution.\n"
+        "- Package management commands (apt, yum, etc.) are mapped to [cyan]winget[/].\n"
+        "- Some commands (like software installs or specific system queries) may require [yellow]Administrator privileges[/] and will trigger a UAC prompt.",
+        title="Under the Hood",
+        border_style="green",
+        expand=False
+    ))
+    console.print()
+    console.print("Type [cyan]exit[/] or [cyan]quit[/] to leave Swodnil.")
+    console.print()
 
 def get_prompt_input() -> str:
     """Gets user input with a formatted prompt."""
