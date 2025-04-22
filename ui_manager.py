@@ -6,30 +6,41 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 import pyfiglet
+import time
 
 # Initialize the Rich Console globally
 console = Console()
 
 def display_startup():
-    """Displays the cool ASCII art startup sequence."""
-    console.print("\n" * 2) # Add some spacing before
+    """Displays the cool ASCII art startup sequence - Line by Line."""
+    console.clear() # Start with a clear screen (optional)
     try:
-        ascii_banner = pyfiglet.figlet_format("Swodnil", font="slant")
-        console.print(f"[bold magenta]{ascii_banner}[/bold magenta]")
+        ascii_banner_str = pyfiglet.figlet_format("Swodnil", font="slant")
+        lines = ascii_banner_str.splitlines()
+        delay = 0.25 # Adjust delay between lines (seconds)
+
+        console.print() # Initial newline
+        for line in lines:
+            console.print(f"[bold magenta]{line}[/bold magenta]")
+            time.sleep(delay)
+        console.print() # Extra newline after banner
+
     except Exception as e:
+        # Fallback if pyfiglet fails
         console.print("[bold magenta] S W O D N I L [/bold magenta]")
         console.print(f"[yellow]Note: pyfiglet banner failed: {e}[/yellow]")
 
-    console.print("[cyan]Welcome to Swodnil - Linux commands on Windows![/cyan]")
-    console.print("[dim]Type 'exit' or 'quit' to leave.[/dim]\n")
+    console.print("[magenta]Welcome to Swodnil - A Linux to Windows command translator![/magenta]")
+    console.print("[dim]Type 'help' to get started.[/dim]")
+    console.print("[dim]Type 'exit' or 'quit' at any time.[/dim]\n")
 
 def display_help_page():
     """Displays the custom Swodnil help page."""
     console.print() # Add spacing before the help page
     console.print(Panel(
-        "[bold red]Welcome to Swodnil![/]\n\n"
+        "[bold red]Welcome to Swodnil, a program built by Daolyap[/]\n\n"
         "A command-line interface providing a Linux-like experience on Windows.\n"
-        "It translates many common Linux commands and flags into their PowerShell equivalents.",
+        "It translates many common Linux commands and flags into their PowerShell equivalents."
         "I am open to suggestions!",
         title="Swodnil Help",
         border_style="magenta",
@@ -44,7 +55,7 @@ def display_help_page():
         header_style="bold blue",
         border_style="dim"
     )
-    builtins_table.add_column("Command", style="cyan", width=25)
+    builtins_table.add_column("Command", style="magenta", width=25)
     builtins_table.add_column("Description")
 
     builtins_table.add_row("help", "Display this help message.")
@@ -67,7 +78,7 @@ def display_help_page():
         header_style="bold blue",
         border_style="dim"
     )
-    translated_table.add_column("Linux Command(s)", style="cyan", width=25)
+    translated_table.add_column("Linux Command(s)", style="magenta", width=25)
     translated_table.add_column("Purpose / Windows Equivalent")
 
     translated_table.add_row("ls, dir", "List directory contents (uses [dim]Get-ChildItem[/]).")
@@ -97,14 +108,14 @@ def display_help_page():
         "- Swodnil intercepts commands and checks its internal map.\n"
         "- If a match is found (e.g., 'ls -l'), it constructs the equivalent PowerShell command (e.g., 'Get-ChildItem | Format-Table ...').\n"
         "- If no specific translation exists, the command is passed directly to PowerShell for execution.\n"
-        "- Package management commands (apt, yum, etc.) are mapped to [cyan]winget[/].\n"
+        "- Package management commands (apt, yum, etc.) are mapped to [magenta]winget[/].\n"
         "- Some commands (like software installs or specific system queries) may require [yellow]Administrator privileges[/] and will trigger a UAC prompt.",
         title="Under the Hood",
         border_style="green",
         expand=False
     ))
     console.print()
-    console.print("Type [cyan]exit[/] or [cyan]quit[/] to leave Swodnil.")
+    console.print("Type [magenta]exit[/] or [magenta]quit[/] to leave Swodnil.")
     console.print()
 
 def get_prompt_input() -> str:
@@ -145,7 +156,7 @@ def display_warning(message: str):
 
 def display_info(message: str):
     """Displays an internal informational message from Swodnil itself."""
-    console.print(f"[cyan]{message}[/cyan]")
+    console.print(f"[magenta]{message}[/magenta]")
 
 def display_list(items: list[str], title: str = "Items"):
     """Displays a list of items, possibly in a table for better formatting."""

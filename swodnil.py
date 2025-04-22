@@ -28,7 +28,7 @@ def main():
         ui_manager.console.print_exception(show_locals=True) # Detailed traceback
         ui_manager.display_error(f"An unexpected critical error occurred: {e}")
     finally:
-        ui_manager.console.print("\n[bold cyan]Exiting Swodnil. Goodbye![/bold cyan]")
+        ui_manager.console.print("\n[bold red]Exiting Swodnil...[/bold red]")
 
 if __name__ == "__main__":
     # Check for psutil dependency needed by neofetch simulation
