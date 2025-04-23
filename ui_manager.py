@@ -9,9 +9,8 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.live import Live # For startup animation
 from rich.spinner import Spinner # For startup animation
-# --- Import Text for prompt formatting ---
+# Import Text for potential advanced prompt formatting (though list of tuples is used now)
 from rich.text import Text
-# --- End Import ---
 import pyfiglet
 
 # Initialize the Rich Console globally
@@ -32,6 +31,7 @@ def display_startup():
     spinner = Spinner("dots", text=" Starting...")
 
     try:
+        # Pass console explicitly to Live if running in non-standard environments
         with Live(spinner, refresh_per_second=10, transient=True, console=console) as live:
             for text, delay in loading_stages:
                 spinner.update(text=f" {text}")
@@ -44,6 +44,7 @@ def display_startup():
 
     # --- Phase 2: Static ASCII Banner ---
     try:
+        # Consider adding a check if pyfiglet is installed
         ascii_banner_str = pyfiglet.figlet_format("Swodnil", font="slant") # Or your preferred font
         styled_banner = f"\n[bold magenta]{ascii_banner_str}[/bold magenta]\n" # Add spacing
 
@@ -57,24 +58,17 @@ def display_startup():
 
     # --- Phase 3: Static Welcome Messages ---
     console.print("[bold purple]Welcome to Swodnil - Linux commands on Windows![/bold purple]")
-    console.print("[dim]Type 'help' learn the ways.[/dim]")
     console.print("[dim]Type 'exit' or 'quit' to leave.[/dim]\n")
 
 
-# --- REMOVED get_prompt_input() function ---
-# Input is now handled by prompt_toolkit in shell_core.py
-
-# --- NEW: Helper function to format the prompt string for prompt_toolkit ---
+# --- Helper function to format the prompt string for prompt_toolkit ---
 def get_prompt_string(cwd: str):
     """
     Returns a list of (style_string, text_string) tuples for prompt_toolkit prompt formatting.
     These style strings are basic prompt_toolkit styles.
     """
     # Define prompt_toolkit style strings.
-    # Use standard names or names defined in a prompt_toolkit Style object if you create one.
-    # ANSI color names are often supported by default.
-    # 'bold' and 'fg:' prefixes are common conventions.
-    cwd_style = 'bold #8A2BE2'  # Using a hex code for a specific purple (BlueViolet)
+    cwd_style = 'bold #8A2BE2'  # Hex code for BlueViolet purple
     symbol_style = 'fg:magenta' # Standard magenta
 
     # Construct the list of tuples
@@ -85,6 +79,7 @@ def get_prompt_string(cwd: str):
         ('', ' '),           # Unstyled space after symbol
     ]
     return prompt_tuples
+
 
 def display_output(stdout: str | None, stderr: str | None):
     """Displays captured standard output and standard error from commands (Batch Mode)."""
@@ -100,8 +95,13 @@ def display_streamed_output(line: str, is_stderr: bool):
     else:
         console.print(line)
 
-def display_error(message: str):
-    """Displays an internal error message from Swodnil itself."""
+# Corrected signature to include optional argument
+def display_error(message: str, skip_if_stderr: bool = False):
+    """
+    Displays an internal error message from Swodnil itself,
+    or a command execution error.
+    The skip_if_stderr flag is intended to avoid redundant messages but isn't fully used yet.
+    """
     console.print(f"[bold red]Swodnil Error: {message}[/bold red]")
 
 def display_warning(message: str):
@@ -110,13 +110,14 @@ def display_warning(message: str):
 
 def display_info(message: str):
     """Displays an internal informational message from Swodnil itself."""
-    console.print(f"[purple]{message}[/purple]")
+    console.print(f"[purple]{message}[/purple]") # Purple theme
 
 def display_list(items: list[str], title: str = "Items"):
     """Displays a list of items, possibly in a table for better formatting."""
     if not items:
         console.print(f"[dim]No {title.lower()} to display.[/dim]")
         return
+    # Use purple theme for list title and numbers
     console.print(f"[bold purple]{title}:[/]")
     for i, item in enumerate(items, 1):
         console.print(f"[purple]{i:>4}[/]: {item}")
@@ -126,82 +127,95 @@ def display_help_page():
     """Displays the custom Swodnil help page with purple theme."""
     console.print()
     console.print(Panel(
-        "[bold purple]Welcome to Swodnil![/]\n\n" # Changed to purple
+        "[bold purple]Welcome to Swodnil![/]\n\n"
         "A command-line interface providing a Linux-like experience on Windows.\n"
         "It translates many common Linux commands and flags into their PowerShell equivalents.",
         title="Swodnil Help",
-        border_style="purple", # Changed border
+        border_style="purple",
         expand=False
     ))
     console.print()
 
     # --- Built-in Commands ---
     builtins_table = Table(
-        title="[bold purple]Built-in Shell Commands[/]", # Changed title color
+        title="[bold purple]Built-in Shell Commands[/]",
         show_header=True,
-        header_style="bold medium_purple", # Changed header style
+        header_style="bold medium_purple",
         border_style="dim"
     )
-    builtins_table.add_column("Command", style="magenta", width=25) # Changed command style
+    builtins_table.add_column("Command", style="magenta", width=25)
     builtins_table.add_column("Description")
-
     builtins_table.add_row("help", "Display this help message.")
-    builtins_table.add_row("cd [directory]", "Change the current working directory (use '~' for home).")
+    builtins_table.add_row("cd [directory]", "Change directory (use '~' for home).")
     builtins_table.add_row("exit | quit", "Terminate the Swodnil shell session.")
-    builtins_table.add_row("history", "Show the command history for the current session.")
+    builtins_table.add_row("history", "Show command history for the current session.")
     builtins_table.add_row("alias", "List all defined command aliases.")
     builtins_table.add_row("alias name='command'", "Define a new command alias (saved persistently).")
     builtins_table.add_row("unalias name", "Remove a previously defined alias (saved persistently).")
-    builtins_table.add_row("export NAME=VALUE", "Set an environment variable for Swodnil and its child processes.")
+    builtins_table.add_row("export NAME=VALUE", "Set an environment variable for Swodnil/child processes.")
     builtins_table.add_row("unset NAME", "Remove an environment variable.")
-
     console.print(builtins_table)
     console.print()
 
     # --- Translated Commands Examples ---
     translated_table = Table(
-        title="[bold purple]Common Translated Commands (Examples)[/]", # Changed title color
+        title="[bold purple]Common Translated Commands (Examples)[/]",
         show_header=True,
-        header_style="bold medium_purple", # Changed header style
+        header_style="bold medium_purple",
         border_style="dim"
     )
-    translated_table.add_column("Linux Command(s)", style="magenta", width=25) # Changed command style
+    translated_table.add_column("Linux Command(s)", style="magenta", width=25)
     translated_table.add_column("Purpose / Windows Equivalent")
-
-    translated_table.add_row("ls, dir", "List directory contents (uses [dim]Get-ChildItem[/]).")
-    translated_table.add_row("cp", "Copy files/directories (uses [dim]Copy-Item[/]).")
-    translated_table.add_row("mv", "Move/rename files/directories (uses [dim]Move-Item[/]).")
-    translated_table.add_row("rm, del", "Remove files/directories (uses [dim]Remove-Item[/]).")
-    translated_table.add_row("mkdir", "Create directories (uses [dim]New-Item[/]).")
-    translated_table.add_row("cat", "Display file content (uses [dim]Get-Content[/]; special handling for paths like /etc/fstab, /proc/cpuinfo).")
-    translated_table.add_row("grep", "Search text using patterns (uses [dim]Select-String[/]).")
-    translated_table.add_row("pwd", "Print current working directory.")
-    translated_table.add_row("clear", "Clear the terminal screen (uses [dim]Clear-Host[/]).")
-    translated_table.add_row("wget, curl", "Download files from the web (uses [dim]Invoke-WebRequest[/]).")
-    translated_table.add_row("ps", "List running processes (uses [dim]Get-Process[/]).")
-    translated_table.add_row("kill, killall", "Terminate processes (uses [dim]Stop-Process[/]; may need elevation).")
-    translated_table.add_row("df", "Show disk space usage (uses [dim]Get-PSDrive[/] or [dim]Get-Volume[/]).")
-    translated_table.add_row("apt, yum, dnf, pacman, zypper", "Manage software packages (uses [magenta]winget[/]; install/upgrade/remove need elevation).") # winget maybe magenta?
+    translated_table.add_row("ls, dir", "List contents ([dim]Get-ChildItem[/]).")
+    translated_table.add_row("cp", "Copy ([dim]Copy-Item[/]).")
+    translated_table.add_row("mv", "Move/rename ([dim]Move-Item[/]).")
+    translated_table.add_row("rm, del", "Remove ([dim]Remove-Item[/]).")
+    translated_table.add_row("mkdir", "Create directory ([dim]New-Item[/]).")
+    translated_table.add_row("cat", "Display file content ([dim]Get-Content[/]; special path handling).")
+    translated_table.add_row("grep", "Search text ([dim]Select-String[/]).")
+    translated_table.add_row("pwd", "Print current directory.")
+    translated_table.add_row("clear", "Clear screen ([dim]Clear-Host[/]).")
+    translated_table.add_row("wget, curl", "Download web content ([dim]Invoke-WebRequest[/]).")
+    translated_table.add_row("ps", "List processes ([dim]Get-Process[/]).")
+    translated_table.add_row("kill, killall", "Terminate processes ([dim]Stop-Process[/]; may need elevation).")
+    translated_table.add_row("df", "Disk usage ([dim]Get-PSDrive[/] or [dim]Get-Volume[/]).")
+    translated_table.add_row("apt, yum, dnf, pacman, zypper", "Manage software packages (uses [magenta]winget[/]; needs elevation for changes).")
     translated_table.add_row("hostname", "Show the computer name.")
-    translated_table.add_row("which, command -v", "Locate a command (uses [dim]Get-Command[/]).")
-
+    translated_table.add_row("which, command -v", "Locate a command ([dim]Get-Command[/]).")
     console.print(translated_table)
-    console.print("\n[italic]Note: This is not an exhaustive list. Many other commands and flags are translated or passed to PowerShell.[/italic]\n")
+    console.print("\n[italic]Note: Includes common flags. Many others translated or passed to PowerShell.[/italic]\n")
+
+    # --- Shell Operators ---
+    operators_table = Table(
+        title="[bold purple]Shell Operators[/]",
+        show_header=True,
+        header_style="bold medium_purple",
+        border_style="dim"
+    )
+    operators_table.add_column("Operator", style="magenta", width=10)
+    operators_table.add_column("Description")
+    operators_table.add_row("|", "Pipe: Send output of one command to the input of the next.")
+    operators_table.add_row("&&", "AND: Execute next command only if the previous one succeeds (exit code 0).")
+    operators_table.add_row(";", "Semicolon: Execute next command regardless of previous success/failure.")
+    operators_table.add_row("&", "Background: Run the preceding command(s) in the background (at end of line).")
+    # Add redirection later if implemented: >, >>, <, 2>
+    console.print(operators_table)
+    console.print()
 
     # --- General Info ---
     console.print(Panel(
         "[bold]How Translation Works:[/]\n"
         "- Swodnil intercepts commands and checks its internal map.\n"
-        "- If a match is found (e.g., 'ls -l'), it constructs the equivalent PowerShell command (e.g., 'Get-ChildItem | Format-Table ...').\n"
-        "- If no specific translation exists, the command is passed directly to PowerShell for execution.\n"
-        "- Package management commands (apt, yum, etc.) are mapped to [magenta]winget[/].\n" # Use magenta for winget emphasis
-        "- Some commands (like software installs or specific system queries) may require [yellow]Administrator privileges[/] and will trigger a UAC prompt.",
+        "- If a match is found (e.g., 'ls -l'), it constructs the equivalent PowerShell command.\n"
+        "- If no specific translation exists, the command is passed directly to PowerShell.\n"
+        "- Package management commands (apt, yum, etc.) are mapped to [magenta]winget[/].\n"
+        "- Some commands may require [yellow]Administrator privileges[/] and trigger a UAC prompt (elevation disallowed in pipelines/background).",
         title="Under the Hood",
-        border_style="medium_purple", # Changed border
+        border_style="medium_purple",
         expand=False
     ))
     console.print()
-    console.print("Type [red]exit[/] or [red]quit[/] to leave Swodnil.") # Use magenta for exit
+    console.print("Type [magenta]exit[/] or [magenta]quit[/] to leave Swodnil.")
     console.print()
 
 
@@ -209,6 +223,7 @@ def display_help_page():
 if __name__ == "__main__":
     display_startup()
     display_help_page()
+    # Cannot easily test prompt here anymore
     # print(f"You entered: {test_input}")
     display_output("This is sample stdout.", "This is sample stderr.")
     print("--- Testing Streamed Output ---")
