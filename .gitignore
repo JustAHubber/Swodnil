@@ -1,7 +1,9 @@
-__pycache__/
-backup_baseline/
-bad_Original/
+assets/
+build/
 current/
-ruined_rewrite/
-pull.bat
-push.bat
+build.bat
+command_translator/
+requirements.txt
+shell_core.py
+swodnil.py
+ui_manager.py
