@@ -11,6 +11,9 @@ import random
 import textwrap
 import subprocess
 import re # For chmod parsing
+import base64 # For elevation encoding
+import json # For aliases (though loaded/saved in shell_core)
+from typing import Iterator # <--- ADD THIS IMPORT
 
 try:
     import psutil # Required for simulated neofetch, df, top helpers
@@ -116,13 +119,53 @@ class NonExitingArgumentParser(argparse.ArgumentParser):
         pass
 
 # --- Helper Functions ---
-def _run_powershell_command(command: str, env: dict | None = None) -> tuple[str | None, str | None, int]:
-    """Helper to run a PS command and return stdout, stderr, returncode."""
+def _run_powershell_command(command: str, env: dict | None = None) -> Iterator[tuple[str | None, bool | None, int | None]]:
+    """
+    Helper to run a PS command, yielding output lines and finally the return code.
+    Yields tuples: (line: str | None, is_stderr: bool | None, returncode: int | None)
+    Lines are yielded as (line, is_stderr, None).
+    The final return code is yielded as (None, None, returncode).
+    """
+    try:
+        process = subprocess.Popen(
+            ['powershell', '-NoProfile', '-Command', command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            shell=False,
+            env=env
+        )
+
+        # Read stdout line by line
+        if process.stdout:
+            for line in process.stdout:
+                yield line.strip(), False, None # Yield line, indicate it's not stderr
+
+        # Read stderr line by line after stdout is closed
+        if process.stderr:
+            for line in process.stderr:
+                yield line.strip(), True, None # Yield line, indicate it IS stderr
+
+        # Wait for process to finish and get return code
+        return_code = process.wait()
+        yield None, None, return_code # Yield final return code
+
+    except FileNotFoundError:
+        yield "PowerShell not found in PATH.", True, -1
+        yield None, None, -1 # Also yield return code on error
+    except Exception as e:
+        yield f"Failed to execute PowerShell command: {e}", True, -1
+        yield None, None, -1 # Also yield return code on error
+
+def _run_powershell_command_batch(command: str, env: dict | None = None) -> tuple[str | None, str | None, int]:
+    """Original helper to run PS command and return final output."""
     try:
         process = subprocess.run(
             ['powershell', '-NoProfile', '-Command', command],
             capture_output=True, text=True, encoding='utf-8', errors='replace',
-            shell=False, check=False, env=env # Pass environment if provided
+            shell=False, check=False, env=env
         )
         return process.stdout.strip(), process.stderr.strip(), process.returncode
     except FileNotFoundError:
@@ -931,7 +974,8 @@ def translate_do_release_upgrade_sim(args: list[str]) -> tuple[str | None, bool]
     """
 
     ui_manager.display_info("Checking for Windows Updates using built-in COM object...")
-    stdout, stderr, code = _run_powershell_command(ps_check_cmd) # Check runs non-elevated
+    # Use BATCH version for the check
+    stdout, stderr, code = _run_powershell_command_batch(ps_check_cmd)
     update_count = -1
     if code == 0 and stdout:
         # ui_manager.display_output(stdout, stderr) # Output is noisy, just use parsed count
@@ -943,7 +987,8 @@ def translate_do_release_upgrade_sim(args: list[str]) -> tuple[str | None, bool]
         except Exception: pass
     elif stderr:
         ui_manager.display_error(f"Update check failed: {stderr}")
-        return NO_EXEC_MARKER + "update check failed", False
+        return ps_install_cmd, True # Or NO_EXEC_MARKER, False etc.
+        # return NO_EXEC_MARKER + "update check failed", False
 
     needs_elevation = False
     return_marker = NO_EXEC_MARKER + "update check finished"
@@ -1006,8 +1051,10 @@ def _get_uptime() -> str:
     except Exception as e:
         return f"N/A (Error: {e})"
 
+# --- Update Neofetch Helpers ---
 def _get_package_count() -> str:
-     stdout, stderr, code = _run_powershell_command("winget list | Measure-Object")
+     # Use batch execution for speed
+     stdout, stderr, code = _run_powershell_command_batch("winget list | Measure-Object")
      if code == 0 and stdout:
          match = re.search(r'Count\s+:\s+(\d+)', stdout)
          if match:
@@ -1015,24 +1062,64 @@ def _get_package_count() -> str:
      return "N/A" # Fallback
 
 def _get_gpu_info() -> str:
-     stdout, stderr, code = _run_powershell_command("(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue).Name")
+     # Use batch execution
+     stdout, stderr, code = _run_powershell_command_batch("(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue).Name")
      if code == 0 and stdout:
          return stdout.splitlines()[0].strip() if stdout.strip() else "N/A"
      return "N/A" # Fallback
 
-def _get_pending_updates_count() -> int:
-     ps_check_cmd = """
+# This can potentially be removed
+#def _get_pending_updates_count() -> int:
+#     # Use batch execution
+#     ps_check_cmd = """
+#        try { winget upgrade --all } catch { return -1 }
+#     """ # Keep the script definition concise here
+#     stdout, stderr, code = _run_powershell_command_batch(ps_check_cmd)
+#     if code == 0 and stdout and stdout.strip().isdigit():
+#         return int(stdout.strip())
+#     return -1 # Indicate error
+
+def _get_winget_updates_count() -> int:
+    ps_cmd = """
         try {
-            $UpdateSession = New-Object -ComObject Microsoft.Update.Session;
-            $UpdateSearcher = $UpdateSession.CreateUpdateSearcher();
-            $SearchResult = $UpdateSearcher.Search("IsInstalled=0 and Type='Software'");
-            return $SearchResult.Updates.Count;
-        } catch { return -1 }
-     """
-     stdout, stderr, code = _run_powershell_command(ps_check_cmd)
-     if code == 0 and stdout and stdout.strip().isdigit():
-         return int(stdout.strip())
-     return -1 # Indicate error
+            $updates = winget upgrade | Select-String "^[^\\s]+" 
+            return $updates.Count
+        } catch {
+            return -1
+        }
+    """
+    stdout, stderr, code = _run_powershell_command_batch(ps_cmd)
+    if code == 0 and stdout and stdout.strip().isdigit():
+        return int(stdout.strip())
+    return -1
+
+def _get_windows_updates_count() -> int:
+    # Try PSWindowsUpdate first
+    ps_cmd = """
+        try {
+            Import-Module PSWindowsUpdate -ErrorAction Stop
+            return (Get-WindowsUpdate -MicrosoftUpdate).Count
+        } catch {
+            # Fallback to WMI-based method
+            try {
+                $session = (New-Object -ComObject Microsoft.Update.Session)
+                $searcher = $session.CreateUpdateSearcher()
+                $results = $searcher.Search("IsInstalled=0 and Type='Software'")
+                return $results.Updates.Count
+            } catch {
+                return -1
+            }
+        }
+    """
+    stdout, stderr, code = _run_powershell_command_batch(ps_cmd)
+    if code == 0 and stdout and stdout.strip().isdigit():
+        return int(stdout.strip())
+    return -1
+
+def _get_pending_updates_count() -> tuple[int, int]:
+    winget = _get_winget_updates_count()
+    windows = _get_windows_updates_count()
+    return winget, windows
 
 def translate_neofetch_simulated(args: list[str]) -> tuple[str | None, bool]:
     # ... (neofetch simulation logic using helpers - unchanged) ...
@@ -1041,7 +1128,20 @@ def translate_neofetch_simulated(args: list[str]) -> tuple[str | None, bool]:
     # ... (rest of the info gathering logic) ...
     # Example from previous step:
     ui_manager.console.print("\n[bold cyan]Swodnil System Info:[/bold cyan]")
-    logo = ["███████╗", "██╔════╝", "███████╗", "╚════██║", "███████║", "╚══════╝"]; logo_color = "magenta"
+    logo = [
+    "╔══════════╦══════════╗",
+    "║██████████║██████████║",
+    "║██████████║██████████║",
+    "║██████████║██████████║",
+    "║██████████║██████████║",
+    "╠══════════╬══════════╣",
+    "║██████████║██████████║",
+    "║██████████║██████████║",
+    "║██████████║██████████║",
+    "║██████████║██████████║",
+    "╚══════════╩══════════╝"
+
+        ]; logo_color = "magenta" #╔ ╗╚ ╝ ═ ║
     info = {}
     try: info['Hostname'] = platform.node()
     except Exception: info['Hostname'] = "N/A"
@@ -1066,11 +1166,26 @@ def translate_neofetch_simulated(args: list[str]) -> tuple[str | None, bool]:
         info[f'Storage({drive_letter})'] = f"{_format_bytes(disk.used)} / {_format_bytes(disk.total)} ({disk.percent}%)"
     except Exception as e: info[f'Storage({drive_letter})'] = f"N/A (Err:{e})" # Use drive letter determined above
     try:
-        updates_count = _get_pending_updates_count() # Use helper
-        if updates_count > 0: info['Updates'] = f"[yellow]{updates_count} Pending[/yellow]"
-        elif updates_count == 0: info['Updates'] = "System up-to-date"
-        else: info['Updates'] = "[dim]N/A (Check failed)[/dim]"
-    except Exception as e: info['Updates'] = f"N/A (Err:{e})"
+        winget_count, windows_count = _get_pending_updates_count()
+        update_parts = []
+
+        if winget_count == 0:
+            update_parts.append("Packages up to date")
+        elif winget_count > 0:
+            update_parts.append(f"[cyan]{winget_count} Packages Pending[/cyan]")
+        else:
+            update_parts.append("[dim]Packages check failed[/dim]")
+
+        if windows_count == 0:
+            update_parts.append("Windows up to date")
+        elif windows_count > 0:
+            update_parts.append(f"[cyan]{windows_count} Windows Updates Pending[/cyan]")
+        else:
+            update_parts.append("[dim]Windows check failed[/dim]")
+
+        info['Updates'] = " | ".join(update_parts)
+    except Exception as e:
+        info['Updates'] = f"N/A (Err:{e})"
 
     max_key_len = max(len(k) for k in info.keys()) if info else 0; output_lines = []
     info_items = list(info.items())
