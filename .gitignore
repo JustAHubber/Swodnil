@@ -1,0 +1,7 @@
+__pycache__/
+backup_baseline/
+bad_Original/
+current/
+ruined_rewrite/
+pull.bat
+push.bat
