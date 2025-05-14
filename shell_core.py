@@ -173,8 +173,8 @@ def parse_command_line(line: str) -> list[tuple[str, Separator | None]]:
                  is_trailing = True
                  for j in range(i + 1, n):
                      if not line[j].isspace(): is_trailing = False; break
-                 if is_trailing: separator = Separator.BACKGROUND; increment = n
-                 else: current_segment += char # Treat as literal '&'
+                 if is_trailing: separator = Separator.BACKGROUND; increment = n # Consume rest of line for trailing &
+                 else: current_segment += char # Treat as literal '&' if not properly trailing
             else: current_segment += char
 
             if separator:
@@ -194,10 +194,41 @@ def parse_command_line(line: str) -> list[tuple[str, Separator | None]]:
     # Add the last segment if non-empty
     last_segment = current_segment.strip()
     if last_segment:
-        last_separator = Separator.BACKGROUND if 'separator' in locals() and separator == Separator.BACKGROUND else None
-        segments.append((last_segment, last_separator))
+        # Check if the very last operator parsed was a background operator
+        # This needs to be robust. If 'separator' was set in the loop for the *last* operator
+        # and it was BACKGROUND, then this segment's separator is None, but the BACKGROUND
+        # applies to the whole line.
+        # Let's adjust how background is added. A segment can end with Separator.BACKGROUND only if it's the truly last one.
+        is_overall_background = False
+        if segments and segments[-1][1] == Separator.BACKGROUND:
+            is_overall_background = True
+            # Remove the background separator from the last parsed segment, it's a global state for this command group
+            segments[-1] = (segments[-1][0], None)
 
-    segments = [(cmd, sep) for cmd, sep in segments if cmd]
+
+        final_separator_for_this_segment = None
+        if is_overall_background and not segments: # Single command ending with &
+            final_separator_for_this_segment = Separator.BACKGROUND
+
+        segments.append((last_segment, final_separator_for_this_segment))
+
+
+    segments = [(cmd, sep) for cmd, sep in segments if cmd] # Clean empty commands again
+
+    # If the original line ended with '&' (and it was parsed as BACKGROUND),
+    # the last segment in `segments` might not have Separator.BACKGROUND yet.
+    # This ensures the *last* segment correctly indicates the backgrounding.
+    # The parser was changed to consume the rest of the line for trailing &,
+    # so the last element should already have it or None.
+
+    # Ensure only the very last segment can have Separator.BACKGROUND
+    if len(segments) > 1:
+        for k in range(len(segments) -1):
+            if segments[k][1] == Separator.BACKGROUND:
+                # This is an error or misparse, treat as literal & if not truly trailing
+                # For now, let's assume parse_command_line handles this by not assigning BACKGROUND unless it's trailing
+                pass # Or convert to literal ampersand processing earlier in parse_command_line
+
     return segments
 
 
@@ -219,20 +250,21 @@ def run_shell():
     swodnil_completer = SwodnilCompleter(aliases, command_translator.TRANSLATION_MAP)
     session = PromptSession(history=history, auto_suggest=AutoSuggestFromHistory(), completer=swodnil_completer, complete_while_typing=True, reserve_space_for_menu=6)
     command_history_list: list[str] = list(session.history.get_strings()) if history else []
-    background_jobs = {}
+    background_jobs = {} # Stores Popen objects for background jobs: {job_id: process}
     next_job_id = 1
 
     while True:
         # 1. Read Input
         try:
             try: cwd = os.getcwd()
-            except OSError: cwd = "[dim]?[/dim]"
+            except OSError: cwd = "[dim]?[/dim]" # Handle errors like deleted CWD
             prompt_message = ui_manager.get_prompt_string(cwd)
+            # Add rprompt for visual flair or info
             raw_input_line = session.prompt(prompt_message, rprompt="Swodnil")
             if raw_input_line.strip(): command_history_list.append(raw_input_line)
-        except KeyboardInterrupt: continue # Catch Ctrl+C during prompt
-        except EOFError: break # Catch Ctrl+D/Ctrl+Z during prompt
-        if not raw_input_line.strip(): continue
+        except KeyboardInterrupt: continue # Ctrl+C at prompt, new prompt
+        except EOFError: break # Ctrl+D or Ctrl+Z at prompt, exit shell
+        if not raw_input_line.strip(): continue # Empty input
 
         # 2. Parse Command Line
         try:
@@ -246,12 +278,17 @@ def run_shell():
             single_command_str, single_separator = parsed_commands[0]
             is_background_builtin_attempt = (single_separator == Separator.BACKGROUND)
 
+            # Prevent built-ins (except potentially some passive ones if designed) from running in background
             if is_background_builtin_attempt:
-                 # No need to parse, just show error
-                 try: cmd_name = shlex.split(single_command_str)[0] # Get command name if possible
-                 except: cmd_name = "Built-in"
-                 ui_manager.display_error(f"{cmd_name} command cannot be run in the background.")
-                 continue # Skip to next prompt
+                 # Temporarily parse to get command name for error message
+                 try: temp_parts_for_error = shlex.split(single_command_str, posix=False)
+                 except: temp_parts_for_error = None
+                 cmd_name_for_error = temp_parts_for_error[0] if temp_parts_for_error else "Built-in"
+
+                 # Allow 'clear &' or 'history &' ? For now, disallow all.
+                 # if cmd_name_for_error.lower() not in ['some_allowed_bg_builtin']:
+                 ui_manager.display_error(f"Built-in command '{cmd_name_for_error}' cannot be run in the background.")
+                 continue # Skip to next prompt iteration
 
             # Apply alias if it's the single command
             processed_single_command_str = single_command_str
@@ -264,73 +301,97 @@ def run_shell():
 
             # --- Try block specifically for parsing/executing single built-ins ---
             try:
-                 parts = shlex.split(processed_single_command_str)
+                 parts = shlex.split(processed_single_command_str, posix=False)
                  if parts:
                       command = parts[0]; args = parts[1:]; cmd_lower = command.lower()
+                      # List of built-in commands
                       builtins = ['help', 'exit', 'quit', 'cd', 'history', 'alias', 'unalias', 'export', 'unset']
                       if cmd_lower in builtins:
                           # --- Execute Built-in ---
-                          last_return_code = 0 # Default to success for builtins unless error
+                          last_return_code_builtin = 0 # Default to success for builtins unless error
                           if cmd_lower == 'help': ui_manager.display_help_page()
                           elif cmd_lower in ['exit', 'quit']: raise EOFError # Signal loop exit cleanly
                           elif cmd_lower == 'cd':
                               target_dir = os.path.expanduser("~") if not args else args[0]
-                              try: expanded_target_dir = os.path.expandvars(target_dir); os.chdir(expanded_target_dir); shell_environment['PWD'] = os.getcwd()
-                              except Exception as e: ui_manager.display_error(f"cd failed: {e}"); last_return_code = 1
+                              try:
+                                  expanded_target_dir = os.path.expandvars(target_dir) # Expand env vars in path
+                                  os.chdir(expanded_target_dir)
+                                  shell_environment['PWD'] = os.getcwd() # Update PWD
+                              except FileNotFoundError: ui_manager.display_error(f"cd: no such file or directory: {expanded_target_dir}"); last_return_code_builtin = 1
+                              except Exception as e: ui_manager.display_error(f"cd failed: {e}"); last_return_code_builtin = 1
                           elif cmd_lower == 'history': ui_manager.display_list(command_history_list, title="Command History")
                           elif cmd_lower == 'alias':
-                              if not args: ui_manager.display_list([f"{n}='{c}'" for n, c in sorted(aliases.items())], title="Aliases")
+                              if not args: ui_manager.display_list([f"{name}='{cmd_val}'" for name, cmd_val in sorted(aliases.items())], title="Aliases")
                               elif '=' in args[0]:
-                                  try: n, c = args[0].split('=', 1); c = c.strip("'\""); aliases[n] = c; swodnil_completer.commands.add(n); ui_manager.display_info(f"Alias '{n}' set."); _save_aliases(aliases)
-                                  except ValueError: ui_manager.display_error("alias: invalid format."); last_return_code = 1
-                              else: n = args[0]; ui_manager.console.print(f"alias {n}='{aliases[n]}'") if n in aliases else ui_manager.display_error(f"alias: {n}: not found"); last_return_code = 0 if n in aliases else 1
+                                  try: name, cmd_val = args[0].split('=', 1); cmd_val = cmd_val.strip("'\""); aliases[name] = cmd_val; swodnil_completer.commands.add(name); ui_manager.display_info(f"Alias '{name}' set."); _save_aliases(aliases)
+                                  except ValueError: ui_manager.display_error("alias: invalid format. Use name='command'"); last_return_code_builtin = 1
+                              else: name = args[0]; ui_manager.console.print(f"alias {name}='{aliases[name]}'") if name in aliases else ui_manager.display_error(f"alias: {name}: not found"); last_return_code_builtin = 0 if name in aliases else 1
                           elif cmd_lower == 'unalias':
-                              if not args: ui_manager.display_error("unalias: missing name"); last_return_code = 1
-                              else: n = args[0];
-                              if n in aliases: del aliases[n]; swodnil_completer.commands.discard(n); ui_manager.display_info(f"Alias '{n}' removed."); _save_aliases(aliases)
-                              else: ui_manager.display_error(f"unalias: {n}: not found"); last_return_code = 1
+                              if not args: ui_manager.display_error("unalias: missing operand"); last_return_code_builtin = 1
+                              else:
+                                  name = args[0]
+                                  if name in aliases: del aliases[name]; swodnil_completer.commands.discard(name); ui_manager.display_info(f"Alias '{name}' removed."); _save_aliases(aliases)
+                                  else: ui_manager.display_error(f"unalias: {name}: not found"); last_return_code_builtin = 1
                           elif cmd_lower == 'export':
-                              if not args: ui_manager.display_error("export: invalid format."); last_return_code = 1
+                              if not args or '=' not in args[0]: ui_manager.display_error("export: invalid format. Use NAME=VALUE or export NAME to display."); last_return_code_builtin = 1
                               elif '=' in args[0]:
-                                  try: n, v = args[0].split('=', 1); v = v.strip("'\""); shell_environment[n] = os.path.expandvars(v); ui_manager.display_info(f"Exported '{n}'.")
-                                  except ValueError: ui_manager.display_error("export: invalid format."); last_return_code = 1
-                              else: n = args[0]; ui_manager.display_info(f"{n}={shell_environment[n]}") if n in shell_environment else ui_manager.display_error(f"export: var '{n}' not found."); last_return_code = 0 if n in shell_environment else 1
+                                  try: name, value = args[0].split('=', 1); value = value.strip("'\""); shell_environment[name] = os.path.expandvars(value); ui_manager.display_info(f"Exported '{name}'.")
+                                  except ValueError: ui_manager.display_error("export: invalid format."); last_return_code_builtin = 1
+                              else: # This case should be caught by the first condition, but as a fallback
+                                  name = args[0]; ui_manager.display_info(f"{name}={shell_environment[name]}") if name in shell_environment else ui_manager.display_error(f"export: var '{name}' not found."); last_return_code_builtin = 0 if name in shell_environment else 1
                           elif cmd_lower == 'unset':
-                              if not args: ui_manager.display_error("unset: missing name"); last_return_code = 1
-                              else: n = args[0];
-                              if n in shell_environment: del shell_environment[n]; ui_manager.display_info(f"Unset '{n}'.")
-                              else: ui_manager.display_warning(f"unset: var '{n}' not found."); last_return_code = 0
-                          # If it was a built-in, skip rest of loop for this input line
+                              if not args: ui_manager.display_error("unset: missing operand"); last_return_code_builtin = 1
+                              else:
+                                  name = args[0]
+                                  if name in shell_environment: del shell_environment[name]; ui_manager.display_info(f"Unset '{name}'.")
+                                  else: ui_manager.display_warning(f"unset: var '{name}' not found (no error)."); last_return_code_builtin = 0 # Unsetting non-existent is not an error in bash
+
+                          # If it was a built-in, set last_return_code and skip rest of loop
+                          # For now, 'last_return_code' is not globally used by pipeline yet, but good to have
+                          # last_return_code = last_return_code_builtin
                           continue # Go to next prompt iteration
 
-            # --- CORRECTED Exception Handling for Single Built-in Check ---
-            except ValueError as e: # Catch shlex parsing errors
-                 ui_manager.display_error(f"Input parsing error: {e}")
-                 continue # Skip rest of loop for this input
-            except OSError as e: # Catch potential OS errors from cd etc.
+            # --- Exception Handling for Single Built-in Check ---
+            except ValueError as e: # Catches shlex parsing errors for the processed_single_command_str
+                 ui_manager.display_error(f"Input parsing error for built-in: {e}")
+                 continue
+            except OSError as e: # Catches potential OS errors from cd etc.
                  ui_manager.display_error(f"OS error executing built-in: {e}")
-                 continue # Skip rest of loop
-            # --- Let EOFError and KeyboardInterrupt propagate ---
+                 # last_return_code = 1 # Update if using last_return_code for pipeline logic
+                 continue
+            # Allow EOFError to propagate to exit the main while True loop
+            # Allow KeyboardInterrupt to be caught by the main loop's handler
             # --- End Single Built-in Check ---
 
 
         # --- If not a handled single built-in, proceed with pipeline/external command execution ---
-        last_return_code = 0
-        pipeline_failed_for_and = False
-        current_pipeline_segments_translated: list[str] = []
-        current_pipeline_original_commands: list[str] = []
-        needs_elevation_overall = False # Track if elevation needed for the whole sequence
+        last_return_code = 0 # Tracks the exit code of the last executed command/pipeline segment
+        pipeline_failed_for_and = False # Flag for '&&' conditional execution
+        current_pipeline_segments_translated: list[str] = [] # Holds PS commands for current pipe group
+        current_pipeline_original_commands: list[str] = [] # Holds original commands for display
+        needs_elevation_overall = False # Tracks if any command in the current execution group needs elevation
 
         for cmd_index, (command_str, separator) in enumerate(parsed_commands):
 
             # --- Conditional Execution Check (&&) ---
             if pipeline_failed_for_and:
-                 if separator == Separator.SEMICOLON: pipeline_failed_for_and = False
-                 continue
+                 if separator == Separator.SEMICOLON: # Reset for ';'
+                     pipeline_failed_for_and = False
+                 continue # Skip this command and subsequent ones until ';' or end of line
 
             # --- Process Segment (Alias, Parse, Translate) ---
             processed_command_str = command_str
-            if cmd_index == 0: # Apply alias only to first command of the line
+            # Alias expansion only for the first command in a pipeline, or any standalone command.
+            # If cmd_index == 0, it's definitely the start.
+            # If cmd_index > 0, it means there was a previous command. We need to check if the *previous* separator
+            # was NOT a pipe. If it was ';', '&&', or initial command, then this new segment can have an alias.
+            can_apply_alias = False
+            if cmd_index == 0:
+                can_apply_alias = True
+            elif cmd_index > 0 and parsed_commands[cmd_index-1][1] != Separator.PIPE:
+                can_apply_alias = True
+
+            if can_apply_alias:
                 potential_alias = command_str.split(maxsplit=1)[0]
                 if potential_alias in aliases:
                     alias_expansion = aliases[potential_alias]
@@ -338,113 +399,180 @@ def run_shell():
                     processed_command_str = f"{alias_expansion} {remaining_args}".strip()
                     ui_manager.console.print(f"[dim]Alias expanded: {potential_alias} -> {processed_command_str}[/dim]")
 
-            try: # Parse
-                parts = shlex.split(processed_command_str)
-                if not parts: ui_manager.display_error("Syntax error: Empty command segment."); pipeline_failed_for_and=True; break
+            try: # Parse the (potentially alias-expanded) command string
+                parts = shlex.split(processed_command_str, posix=False)
+                if not parts: # Empty segment after alias expansion or due to parsing e.g. 'alias x=""' then 'x'
+                    ui_manager.display_error("Syntax error: Empty command segment.")
+                    pipeline_failed_for_and=True; break
                 command = parts[0]; args = parts[1:]
-                current_pipeline_original_commands.append(processed_command_str) # Store original
-            except ValueError as e: ui_manager.display_error(f"Parsing error: {e}"); pipeline_failed_for_and=True; break
+                current_pipeline_original_commands.append(processed_command_str) # Store original for display
+            except ValueError as e:
+                ui_manager.display_error(f"Parsing error for '{processed_command_str}': {e}")
+                pipeline_failed_for_and=True; break # Critical parsing error for this segment
 
-            # Check disallowed built-ins in complex sequences
+            # Check disallowed built-ins in complex sequences (pipes, &&, ;)
             cmd_lower = command.lower()
-            if len(parsed_commands) > 1 and cmd_lower in ['help', 'exit', 'quit', 'cd', 'alias', 'unalias', 'export', 'unset']:
-                 ui_manager.display_error(f"Built-in '{cmd_lower}' invalid in complex command sequences.")
+            # Stricter check: any built-in in a multi-segment line or piped is usually problematic.
+            if (len(parsed_commands) > 1 or separator == Separator.PIPE or (cmd_index > 0 and parsed_commands[cmd_index-1][1] == Separator.PIPE)) \
+               and cmd_lower in ['help', 'exit', 'quit', 'cd', 'alias', 'unalias', 'export', 'unset', 'history']:
+                 ui_manager.display_error(f"Built-in command '{cmd_lower}' is invalid in this complex command sequence.")
                  pipeline_failed_for_and = True; break
 
             # Translate
+            is_segment_simulated_and_standalone_valid = False # Flag for this segment
             try:
                 translation_result, needs_elevation_segment = command_translator.process_command(command, args)
                 if needs_elevation_segment:
-                    needs_elevation_overall = True # Mark if any part needs elevation
-                    if len(parsed_commands) > 1 or separator == Separator.BACKGROUND:
-                        ui_manager.display_error(f"Elevation for '{command}' disallowed in sequences/background.")
-                        pipeline_failed_for_and = True; break
+                    needs_elevation_overall = True # Mark if any part needs elevation for the current group
+                    # Check if elevation is allowed in this context
+                    if len(parsed_commands) > 1 or separator == Separator.BACKGROUND or \
+                       (cmd_index > 0 and parsed_commands[cmd_index-1][1] == Separator.PIPE) or \
+                       (separator == Separator.PIPE):
+                        ui_manager.display_error(f"Elevation for '{command}' is disallowed in pipelines, sequences, or background jobs.")
+                        pipeline_failed_for_and = True; # This will break below
+
+                if pipeline_failed_for_and: break # If elevation check failed, stop this command line
 
                 if isinstance(translation_result, str):
                     if translation_result.startswith(SIMULATION_MARKER_PREFIX):
-                        ui_manager.display_error(f"Simulation '{command}' invalid in sequences/background.")
-                        pipeline_failed_for_and = True; break
+                        is_problematic_sequence_for_sim = (
+                            (len(parsed_commands) > 1 and (separator is not None and separator != Separator.BACKGROUND)) or
+                            (cmd_index > 0 and parsed_commands[cmd_index-1][1] == Separator.PIPE)
+                        )
+                        if is_problematic_sequence_for_sim:
+                            ui_manager.display_error(f"Simulation '{command}' is invalid in this command sequence context.")
+                            pipeline_failed_for_and = True;
+                        else:
+                            is_segment_simulated_and_standalone_valid = True
+                            # Simulation runs when command_translator.process_command is called.
+                            # It does not add to current_pipeline_segments_translated.
                     elif translation_result.startswith(NO_EXEC_MARKER):
-                        pipeline_failed_for_and = True; break
-                    else: current_pipeline_segments_translated.append(translation_result)
-                elif translation_result is None: current_pipeline_segments_translated.append(processed_command_str)
-                else: ui_manager.display_error("Internal translator error."); pipeline_failed_for_and = True; break
-            except Exception as e: ui_manager.display_error(f"Translation error: {e}"); pipeline_failed_for_and = True; break
+                        pipeline_failed_for_and = True # Message already displayed by translator
+                    else: # Regular PowerShell command string
+                        current_pipeline_segments_translated.append(translation_result)
+                elif translation_result is None: # Native command, pass as is
+                    current_pipeline_segments_translated.append(processed_command_str)
+                else: # Should not happen
+                    ui_manager.display_error(f"Internal Swodnil error: Unexpected translation result type for '{command}'.")
+                    pipeline_failed_for_and = True
 
-            if pipeline_failed_for_and: break # Stop processing line if segment failed
+            except Exception as e:
+                ui_manager.display_error(f"Error during translation of '{command}': {e}")
+                import traceback; traceback.print_exc() # For debugging
+                pipeline_failed_for_and = True
+            
+            if pipeline_failed_for_and: break # Stop processing this command line if translation or checks failed
 
             # --- Execute assembled pipeline if separator is NOT PIPE ---
+            # (or if it's the end of the line, or if a simulation just ran standalone)
             if separator != Separator.PIPE:
-                final_command_exec_str = " | ".join(current_pipeline_segments_translated)
-                original_cmd_display = " | ".join(current_pipeline_original_commands)
-                current_pipeline_segments_translated = [] # Reset for next group
-                current_pipeline_original_commands = []
+                final_command_exec_str = ""
+                if not is_segment_simulated_and_standalone_valid or current_pipeline_segments_translated:
+                    # If it wasn't a simulation that ran standalone, OR if it was a simulation
+                    # preceded by piped commands, build the PS string.
+                    final_command_exec_str = " | ".join(current_pipeline_segments_translated)
 
-                if final_command_exec_str:
-                    is_background_job = (separator == Separator.BACKGROUND)
-                    can_elevate_this = needs_elevation_overall and len(parsed_commands) == 1 and not is_background_job
+                original_cmd_display = " | ".join(current_pipeline_original_commands)
+                
+                # Reset for the next command group (after ;, &&, or background)
+                current_pipeline_segments_translated = []
+                current_pipeline_original_commands = []
+                
+                temp_needs_elevation_overall = needs_elevation_overall # Store for this execution group
+                needs_elevation_overall = False # Reset for next group
+
+
+                if final_command_exec_str: # If there's an actual PowerShell command to execute
+                    is_background_job = (separator == Separator.BACKGROUND and cmd_index == len(parsed_commands) -1)
+                    can_elevate_this = temp_needs_elevation_overall and not is_background_job and \
+                                       (len(parsed_commands) == 1 or (separator != Separator.PIPE and separator != Separator.AND and separator != Separator.SEMICOLON))
+
 
                     if is_background_job:
-                        # --- Execute Background ---
                         ui_manager.console.print(f"[dim]Running in background: {original_cmd_display}[/dim]")
                         try:
                             process = subprocess.Popen(['powershell', '-NoProfile', '-Command', final_command_exec_str],
-                                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False, env=shell_environment)
-                            # Store original command with Popen object for job display
-                            process.swodnil_cmd_str = original_cmd_display
+                                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                                        shell=False, env=shell_environment, creationflags=subprocess.CREATE_NO_WINDOW)
+                            process.swodnil_cmd_str = original_cmd_display # Store original command for job display
                             job_id = next_job_id; background_jobs[job_id] = process; next_job_id += 1
                             ui_manager.console.print(f"[{job_id}] {process.pid} {original_cmd_display}")
                             last_return_code = 0
-                        except Exception as e: ui_manager.display_error(f"Failed to start job: {e}"); last_return_code = 1
+                        except Exception as e: ui_manager.display_error(f"Failed to start background job: {e}"); last_return_code = 1
+                    
                     elif can_elevate_this:
-                        # --- Handle Elevation ---
-                        ui_manager.display_warning(f"Command '{command}' may require Admin privileges.")
+                        ui_manager.display_warning(f"Command '{original_cmd_display}' may require Admin privileges.")
                         confirm = ui_manager.console.input("Attempt to run elevated? [y/N]: ")
                         if confirm.lower() == 'y':
                             try:
-                                command_to_elevate = final_command_exec_str + '; Read-Host -Prompt "Press Enter to close window"'
+                                # Add a pause to keep the elevated window open to see output/errors
+                                command_to_elevate = final_command_exec_str + '; Write-Host "`n--- Elevated command finished. ---"; Read-Host -Prompt "Press Enter to close this window"'
                                 encoded_command = base64.b64encode(command_to_elevate.encode('utf-16le')).decode('ascii')
-                                elevate_cmd = f'Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile", "-EncodedCommand", "{encoded_command}"'
-                                _, _, code_elev = command_translator._run_powershell_command_batch(elevate_cmd, env=shell_environment)
-                                last_return_code = code_elev
-                                if code_elev != 0: ui_manager.display_error(f"Elevation failed (Code: {code_elev}).")
-                            except Exception as e: ui_manager.display_error(f"Error elevating: {e}"); last_return_code = 1
-                        else: ui_manager.display_info("Elevation cancelled."); last_return_code = 1
-                    else:
-                        # --- Execute Foreground ---
+                                elevate_cmd_args = [
+                                    "powershell", "-Command",
+                                    f'Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile", "-EncodedCommand", "{encoded_command}"'
+                                ]
+                                # Run Start-Process itself non-elevated, it will trigger UAC
+                                elevation_process = subprocess.run(elevate_cmd_args, capture_output=True, text=True, shell=False, env=shell_environment)
+                                if elevation_process.returncode != 0:
+                                    ui_manager.display_error(f"Failed to initiate elevation (Start-Process error): {elevation_process.stderr}")
+                                    last_return_code = elevation_process.returncode
+                                else:
+                                    # Cannot get return code of the elevated process directly this way easily
+                                    ui_manager.display_info("Elevated command window launched. Check it for results.")
+                                    last_return_code = 0 # Assume success of launching
+                            except Exception as e: ui_manager.display_error(f"Error during elevation attempt: {e}"); last_return_code = 1
+                        else: ui_manager.display_info("Elevation cancelled by user."); last_return_code = 1 # Or some other code for user cancel
+                    
+                    else: # Regular foreground execution
                         ui_manager.console.print(f"[dim]Executing: {final_command_exec_str}[/dim]")
-                        current_pipeline_return_code = -1
+                        current_pipeline_return_code = -1 # Default for error
                         try:
+                            # Use the streaming executor
                             output_generator = command_translator._run_powershell_command(final_command_exec_str, env=shell_environment)
-                            for line, is_stderr_line, code in output_generator: # Renamed 'code' -> 'is_stderr_line', 'final_code' -> 'code'
-                                if line is not None: ui_manager.display_streamed_output(line, is_stderr_line)
-                                elif code is not None: current_pipeline_return_code = code
+                            for line_content, is_stderr_line, exit_code_from_stream in output_generator:
+                                if line_content is not None:
+                                    ui_manager.display_streamed_output(line_content, is_stderr_line)
+                                elif exit_code_from_stream is not None:
+                                    current_pipeline_return_code = exit_code_from_stream
+                            
                             last_return_code = current_pipeline_return_code
                             if last_return_code != 0:
-                                ui_manager.display_error(f"Command finished with exit code {last_return_code}") # Always show code
-                                if last_return_code == 5: ui_manager.display_info("Hint: Exit code 5 often means 'Access Denied'.")
-                        except KeyboardInterrupt: ui_manager.display_warning("\nCommand interrupted."); last_return_code = 130
-                        except Exception as e: ui_manager.display_error(f"Execution error: {e}"); last_return_code = 1
+                                # ui_manager.display_error(f"Command finished with exit code {last_return_code}") # Already shown usually
+                                if last_return_code == 5: # Access Denied
+                                    ui_manager.display_info("Hint: Exit code 5 (Access Denied) may indicate need for Admin privileges.")
+                        except KeyboardInterrupt:
+                            ui_manager.display_warning("\nCommand interrupted by user (Ctrl+C).")
+                            last_return_code = 130 # Standard code for SIGINT
+                        except Exception as e:
+                            ui_manager.display_error(f"Unexpected error during command execution: {e}")
+                            last_return_code = 1 # General error
 
-                # Check for && condition failure *after* executing this group
+                elif is_segment_simulated_and_standalone_valid: # Only a simulation ran for this group
+                    last_return_code = 0 # Assume simulation succeeded if it didn't raise an exception
+
+                # Conditional execution logic based on last_return_code
                 if separator == Separator.AND and last_return_code != 0:
                      pipeline_failed_for_and = True
-                # Reset failure flag if separator is ;
-                if separator == Separator.SEMICOLON:
+                elif separator == Separator.SEMICOLON: # Reset for ';' regardless of success
                      pipeline_failed_for_and = False
+                # If separator is None or BACKGROUND, pipeline_failed_for_and state persists or doesn't matter for next line
 
 
         # --- Check for completed background jobs ---
-        completed_jobs = []
-        for job_id, process in background_jobs.items():
-             if process.poll() is not None:
-                 completed_jobs.append(job_id)
-                 rc = process.returncode
-                 cmd_approx = getattr(process, 'swodnil_cmd_str', 'Background Command') # Get stored command
-                 ui_manager.console.print(f"\n[{job_id}]+ Done (Exit code: {rc})\t{cmd_approx}")
-        for job_id in completed_jobs: del background_jobs[job_id]
+        completed_jobs_ids = []
+        for job_id, process_obj in background_jobs.items():
+             if process_obj.poll() is not None: # Check if process has terminated
+                 completed_jobs_ids.append(job_id)
+                 rc = process_obj.returncode
+                 cmd_display_str = getattr(process_obj, 'swodnil_cmd_str', 'Background Command')
+                 status_msg = "Done" if rc == 0 else f"Exit {rc}"
+                 ui_manager.console.print(f"\n[{job_id}]+ {status_msg}\t{cmd_display_str}")
+        for job_id in completed_jobs_ids:
+            del background_jobs[job_id] # Remove completed job from tracking
 
 
 # --- Main entry point ---
 if __name__ == "__main__":
+    # This is typically not run directly, but via swodnil.py
     print("Please run Swodnil via the main 'swodnil.py' script.")

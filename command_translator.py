@@ -358,74 +358,205 @@ def translate_find(args: list[str]) -> str | None:
     return full_cmd
 
 # === Permissions ===
-def translate_chmod(args: list[str]) -> str | None:
-    """Translates VERY basic chmod +/- modes to icacls."""
-    # WARNING: Windows ACLs are fundamentally different from POSIX modes.
-    # This translation is extremely limited and approximate.
-    ui_manager.display_warning("chmod translation is limited and approximate due to ACL differences.")
-    parser = NonExitingArgumentParser(prog='chmod', add_help=False)
-    parser.add_argument('mode', help='Mode string (e.g., +x, u+w, 755 - limited support)')
-    parser.add_argument('file', help='File or directory')
-    try:
-        parsed_args = parser.parse_args(args)
-        mode = parsed_args.mode
-        file = parsed_args.file
-        quoted_file = shlex.quote(file)
-    except ValueError as e:
-        ui_manager.display_error(f"chmod: {e}"); return NO_EXEC_MARKER + "chmod failed"
-
-    # Basic +/- mode mapping for current user (approximation)
-    # Use icacls: /grant grants permissions, /deny denies, /remove removes grants/denies
-    # Permissions: F=Full, M=Modify, RX=Read&Execute, R=Read, W=Write
-    # User: Use '%USERNAME%' which PowerShell should expand, or BUILTIN\Users etc.
-
-    commands = []
-    # Extremely simplified mapping for +w / -w for current user
-    if mode == '+w':
-        # Grant Modify rights to current user
-        commands.append(f'icacls {quoted_file} /grant "%USERNAME%":(M)')
-    elif mode == '-w':
-        # Deny Write rights to current user
-        commands.append(f'icacls {quoted_file} /deny "%USERNAME%":(W)')
-    # Simple +x mapping (Grant Read&Execute)
-    elif mode == '+x':
-        commands.append(f'icacls {quoted_file} /grant "%USERNAME%":(RX)')
-    # Rudimentary numeric mode (only handles basic cases like 777, 755, 644 for owner/users group)
-    # THIS IS HIGHLY APPROXIMATE AND LIKELY INSUFFICIENT FOR REAL USE CASES
-    elif re.match(r'^[0-7]{3}$', mode):
-        ui_manager.display_warning("Numeric chmod modes are poorly mapped to Windows ACLs.")
-        owner_perm = int(mode[0])
-        group_perm = int(mode[1]) # Map group to BUILTIN\Users
-        # other_perm = int(mode[2]) # Hard to map 'other' reliably
-
-        # Reset permissions first? icacls /reset ? (Dangerous)
-        # Grant based on numbers (simplistic)
-        owner_acl = []
-        if owner_perm >= 4: owner_acl.append("R")
-        if owner_perm >= 6: owner_acl.append("W")
-        if owner_perm in [1, 3, 5, 7]: owner_acl.append("X")
-        if owner_acl: commands.append(f'icacls {quoted_file} /grant "%USERNAME%":({"".join(owner_acl)})')
-
-        users_acl = []
-        if group_perm >= 4: users_acl.append("R")
-        if group_perm >= 6: users_acl.append("W") # Often Modify is needed for write access
-        if group_perm in [1, 3, 5, 7]: users_acl.append("X")
-        if users_acl: commands.append(f'icacls {quoted_file} /grant "BUILTIN\\Users":({"".join(users_acl)})')
-
-    else:
-        ui_manager.display_error(f"chmod: Unsupported mode string '{mode}'. Only basic +/-w, +x and simple numeric modes partially supported.")
-        return NO_EXEC_MARKER + "chmod mode unsupported"
-
-    if not commands:
-        ui_manager.display_error(f"chmod: Could not translate mode '{mode}'.")
-        return NO_EXEC_MARKER + "chmod translation failed"
-
-    # Add /T for recursion on directories? Maybe mimic -R flag?
-    # parser.add_argument('-R', '--recursive', action='store_true')
-    # if parsed_args.recursive and os.path.isdir(file):
-    #    params.append("/T") # Add /T for recursion to each icacls command
-
-    return " ; ".join(commands)
+def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
+    """
+    Translates basic chmod +/- modes to icacls.
+    Uses `$(whoami)` for the current user.
+    WARNING: Windows ACLs are fundamentally different from POSIX modes.
+    This translation is EXTREMELY limited and approximate. Elevation is often required.
+    """
+    import re
+    import shlex
+    
+    # Assuming ui_manager and NonExitingArgumentParser are defined elsewhere
+    ui_manager.display_warning("chmod translation to icacls is limited and may not behave as expected.")
+    
+    # If args is empty, show usage and return
+    if not args:
+        ui_manager.display_error("chmod: missing operand")
+        return NO_EXEC_MARKER + "chmod: missing operand\nTry 'chmod [mode] [file...]'", False
+    
+    recursive = False
+    mode_str = None
+    file_paths = []
+    
+    # Simple parsing without argparse to avoid its complications
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ['-R', '--recursive']:
+            recursive = True
+        elif arg.startswith('-') and not arg.startswith('+') and not arg.startswith('-R'):
+            # This handles mode specifications like "-x"
+            mode_str = arg
+        elif arg.startswith('+'):
+            # This handles mode specifications like "+x"
+            mode_str = arg
+        elif re.fullmatch(r'^[0-7]{3,4}$', arg):
+            # This handles numeric mode specifications like "755"
+            mode_str = arg
+        else:
+            # If it's not an option or mode, it must be a file path
+            file_paths.append(arg)
+        i += 1
+    
+    # Validate that we have the necessary arguments
+    if not mode_str:
+        ui_manager.display_error("chmod: missing mode operand")
+        return NO_EXEC_MARKER + "chmod: missing mode operand", False
+    
+    if not file_paths:
+        ui_manager.display_error("chmod: missing file operand")
+        return NO_EXEC_MARKER + "chmod: missing file operand", False
+    
+    needs_elevation = True
+    all_commands = []
+    
+    for file_path in file_paths:
+        current_file_commands = []
+        # shlex.quote is important here to handle paths with spaces correctly in the PS command
+        quoted_file = shlex.quote(file_path)
+        
+        icacls_base_params = [quoted_file]
+        if recursive:
+            icacls_base_params.append("/T")
+        
+        current_user_ps_identifier = "$(whoami)"
+        
+        # --- Symbolic Mode Mapping ---
+        if mode_str == '+x' or mode_str == '+X':
+            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {current_user_ps_identifier}:RX")
+        elif mode_str == '-x' or mode_str == '-X':
+            ui_manager.display_warning("chmod -x: Attempting to DENY Read & Execute (RX) for current user. This is a strong denial.")
+            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /deny {current_user_ps_identifier}:RX")
+        elif mode_str == '+w' or mode_str == '+W':
+            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {current_user_ps_identifier}:M")
+        elif mode_str == '-w' or mode_str == '-W':
+            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /deny {current_user_ps_identifier}:W")
+        elif mode_str == '+r' or mode_str == '+R':
+            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {current_user_ps_identifier}:R")
+        elif mode_str == '-r' or mode_str == '-R':
+            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /deny {current_user_ps_identifier}:R")
+        
+        # --- Rudimentary Numeric Mode ---
+        elif re.fullmatch(r'^[0-7]{3,4}$', mode_str):
+            # Handle both 3-digit (e.g., 755) and 4-digit (e.g., 0755) formats
+            numeric_mode = mode_str[-3:] if len(mode_str) == 4 else mode_str
+            
+            ui_manager.display_warning(
+                f"Numeric chmod mode '{mode_str}' on '{file_path}' is VERY POORLY mapped to Windows ACLs. "
+                "This is a best-effort approximation."
+            )
+            
+            owner_digit = int(numeric_mode[0])
+            group_digit = int(numeric_mode[1])
+            other_digit = int(numeric_mode[2])
+            group_identifier = "BUILTIN\\Users"
+            everyone_identifier = "Everyone"
+            
+            # Map owner permissions
+            owner_perm_str = ""
+            if owner_digit == 7: owner_perm_str = "F"
+            elif owner_digit == 6: owner_perm_str = "M"
+            elif owner_digit == 5: owner_perm_str = "RX"
+            elif owner_digit == 4: owner_perm_str = "R"
+            elif owner_digit == 0:
+                current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /remove {current_user_ps_identifier}")
+            
+            if owner_perm_str:  # Only add grant if a specific perm string was determined
+                current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {current_user_ps_identifier}:{owner_perm_str}")
+            elif owner_digit != 0:  # If it was non-zero but didn't map to a perm_str
+                ui_manager.display_warning(f"chmod: Owner numeric digit '{owner_digit}' in '{mode_str}' for '{file_path}' has no direct icacls grant mapping.")
+            
+            # Map group permissions
+            group_perm_str = ""
+            if group_digit == 7: group_perm_str = "F"
+            elif group_digit == 6: group_perm_str = "M"
+            elif group_digit == 5: group_perm_str = "RX"
+            elif group_digit == 4: group_perm_str = "R"
+            elif group_digit == 0:
+                current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /remove {group_identifier}")
+            
+            if group_perm_str:  # Only add grant if a specific perm string was determined
+                current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {group_identifier}:{group_perm_str}")
+            elif group_digit != 0:  # If it was non-zero but didn't map
+                ui_manager.display_warning(f"chmod: Group numeric digit '{group_digit}' in '{mode_str}' for '{file_path}' has no direct icacls grant mapping.")
+            
+            # Map others permissions
+            other_perm_str = ""
+            if other_digit == 7: other_perm_str = "F"
+            elif other_digit == 6: other_perm_str = "M"
+            elif other_digit == 5: other_perm_str = "RX"
+            elif other_digit == 4: other_perm_str = "R"
+            elif other_digit == 0:
+                current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /remove {everyone_identifier}")
+            
+            if other_perm_str:  # Only add grant if a specific perm string was determined
+                current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {everyone_identifier}:{other_perm_str}")
+            elif other_digit != 0:  # If it was non-zero but didn't map
+                ui_manager.display_warning(f"chmod: Others numeric digit '{other_digit}' in '{mode_str}' for '{file_path}' has no direct icacls grant mapping.")
+        
+        # Handle more complex mode strings with combinations (u+x,g-w,o=r)
+        elif ',' in mode_str or '=' in mode_str:
+            ui_manager.display_warning(f"Complex chmod mode '{mode_str}' attempted. Limited translation to icacls.")
+            
+            # Split by commas to get individual operations
+            operations = mode_str.split(',')
+            for op in operations:
+                # Handle each operation based on pattern
+                if '+' in op:
+                    target, perm = op.split('+')
+                    if 'u' in target or 'a' in target:
+                        if 'x' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {current_user_ps_identifier}:RX")
+                        elif 'w' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {current_user_ps_identifier}:M")
+                        elif 'r' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {current_user_ps_identifier}:R")
+                    
+                    if 'g' in target or 'a' in target:
+                        if 'x' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {group_identifier}:RX")
+                        elif 'w' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {group_identifier}:M")
+                        elif 'r' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {group_identifier}:R")
+                    
+                    if 'o' in target or 'a' in target:
+                        if 'x' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {everyone_identifier}:RX")
+                        elif 'w' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {everyone_identifier}:M")
+                        elif 'r' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /grant {everyone_identifier}:R")
+                
+                elif '-' in op:
+                    target, perm = op.split('-')
+                    if 'u' in target or 'a' in target:
+                        if 'x' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /deny {current_user_ps_identifier}:RX")
+                        elif 'w' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /deny {current_user_ps_identifier}:W")
+                        elif 'r' in perm:
+                            current_file_commands.append(f"icacls {' '.join(icacls_base_params)} /deny {current_user_ps_identifier}:R")
+        
+        else:
+            ui_manager.display_error(f"chmod: Unsupported or complex mode string '{mode_str}' for file '{file_path}'.")
+            # To prevent partial application on multiple files if one has a bad mode:
+            return NO_EXEC_MARKER + f"chmod mode '{mode_str}' unsupported", False
+        
+        if not current_file_commands:
+            # Only display this if it's not a numeric mode that correctly results in only /remove
+            # or if a symbolic mode that should produce a command didn't.
+            ui_manager.display_info(f"chmod: Mode '{mode_str}' for file '{file_path}' did not translate to any actionable icacls grants/denies.")
+        
+        all_commands.extend(current_file_commands)
+    
+    if not all_commands:
+        return NO_EXEC_MARKER + "chmod translation resulted in no actions for any files", False
+    
+    final_command_str = " ; ".join(all_commands)
+    return final_command_str, needs_elevation
 
 def translate_chown(args: list[str]) -> str | None:
     ui_manager.display_error("chown: Changing ownership is complex and differs significantly on Windows.")
@@ -872,10 +1003,10 @@ def translate_apt(args: list[str]) -> tuple[str | None, bool]:
     except ValueError as e: ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed", False
 
     base_cmd="winget"; subcmd=parsed_args.subcommand; params=[]; accept=False
-    needs_elevation = False # Default, most winget read commands are fine
+    needs_elevation = True # Default, most winget read commands are fine
 
     if subcmd == 'update':
-        params.append("source update") # Updating sources might need elevation sometimes? Assume false for now.
+        params.append("source update") # Updating sources
     elif subcmd == 'upgrade':
         params.append("upgrade"); accept=getattr(parsed_args,'yes',False);
         if parsed_args.packages: params.extend([shlex.quote(p) for p in parsed_args.packages])
@@ -897,10 +1028,10 @@ def translate_apt(args: list[str]) -> tuple[str | None, bool]:
 
     if accept: params.extend(["--accept-package-agreements", "--accept-source-agreements"])
 
-    # Add verbose flag maybe?
-    params.append("--disable-interactivity") # Useful for scripting winget
+    # Add verbose flag and update help command too
+    params.append("--disable-interactivity")
 
-    return f"{base_cmd} {' '.join(params)}", needs_elevation
+    return f"{base_cmd} {' '.join(params)}"
 
 
 # --- Update do_release_upgrade_sim to return tuple ---
@@ -1239,7 +1370,9 @@ def translate_hollywood_simulated(args: list[str]) -> tuple[str | None, bool]:
              while True:
                 line = "".join(random.choices(chars, k=random.randint(40, ui_manager.console.width - 1)))
                 color = random.choice(["green", "bright_green", "dim green", "rgb(0,100,0)", "rgb(0,150,0)"])
-                ui_manager.console.print(f"[{color}]{line}", end='\n' if random.random() < 0.05 else '')
+                # Import markup or ensure ui_manager makes it accessible, for now direct import:
+                from rich.markup import escape
+                ui_manager.console.print(f"[{color}]{escape(line)}", end='\n' if random.random() < 0.05 else '')
                 time.sleep(random.uniform(0.005, 0.02))
     except KeyboardInterrupt: ui_manager.console.print("\n[green]...Exiting Hollywood Mode.[/green]")
     return SIMULATION_MARKER_PREFIX + "hollywood", False
