@@ -738,7 +738,7 @@ def translate_chown(args: list[str]) -> tuple[str | None, bool]:
         return NO_EXEC_MARKER + "chown: no executable commands generated for any file.", False
 
     return " ; ".join(final_file_commands), True # Elevation always assumed for chown
-    
+
 # === Text Processing ===
 def translate_cat(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='cat', add_help=False)
