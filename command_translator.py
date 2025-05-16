@@ -188,39 +188,90 @@ def _format_bytes(byte_count: int | None) -> str:
 
 
 # === File System ===
-def translate_ls(args: list[str]) -> str | None:
+def translate_ls(args: list[str]) -> tuple[str | None, bool]:
+    # parser is defined upfront for all cases (help or normal execution)
     parser = NonExitingArgumentParser(prog='ls', add_help=False)
+    
+    # Define ALL arguments the ls command can take, including help
+    parser.add_argument('--help', action='store_true', help='Show this help message')
+    parser.add_argument('-h', action='store_true', dest='help_short', help='Alias for --help') # -h might conflict if used for human-readable for other cmds
+
+    # Regular ls arguments
     parser.add_argument('-l', action='store_true')
     parser.add_argument('-a', '--all', action='store_true')
     parser.add_argument('-R', '--recursive', action='store_true')
-    parser.add_argument('-t', action='store_true') # Sort by time
-    parser.add_argument('-S', action='store_true') # Sort by size
+    parser.add_argument('-t', action='store_true') 
+    parser.add_argument('-S', action='store_true') 
     parser.add_argument('-r', '--reverse', action='store_true')
-    parser.add_argument('paths', nargs='*', default=['.']) # Default to current dir if no paths
-    try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"ls: {e}"); return NO_EXEC_MARKER + "ls failed"
+    
+    # THIS IS THE CRUCIAL LINE FOR 'paths'
+    # It should be defined unconditionally for the parser.
+    parser.add_argument('paths', nargs='*', default=['.']) # 'paths' is a positional argument
+
+    try: 
+        parsed_args = parser.parse_args(args) 
+    except ValueError as e: 
+        ui_manager.display_error(f"ls: {e}")
+        # If parsing fails, it could be an invalid flag.
+        # We might want to show a short help or error message here.
+        # For now, use the generic failure.
+        return NO_EXEC_MARKER + f"ls failed: {str(e)}", False
+
+    # Now, check if help was requested AFTER successful parsing
+    if parsed_args.help or parsed_args.help_short:
+        help_string = """
+[bold magenta]ls - List directory contents[/bold magenta]
+[cyan]Description:[/cyan]
+  Lists information about files and directories. Mapped to PowerShell's `Get-ChildItem`.
+
+[cyan]Common Usage:[/cyan]
+  ls [options] [path...]
+
+[cyan]Supported Flags (approximate mapping):[/cyan]
+  -l              Use a long listing format.
+  -a, --all       Do not ignore entries starting with . (Shows hidden files via `-Force` in PS).
+  -R, --recursive List subdirectories recursively.
+  -t              Sort by modification time, newest first.
+  -S              Sort by file size, largest first.
+  -r, --reverse   Reverse order while sorting.
+  --help, -h      Show this help message.
+  [path...]       Specify directory or files to list. Defaults to current directory.
+
+[cyan]Notes:[/cyan]
+  - PowerShell's `Get-ChildItem` provides the core functionality.
+  - Output formatting for `-l` is an approximation of Linux `ls -l`.
+  - Ownership and permission details are Windows-specific (via `Get-Acl`).
+"""
+        return NO_EXEC_MARKER + "SWODNIL_HELP_MESSAGE:" + help_string.strip(), False
+
+    # If not help, proceed with normal ls logic using parsed_args
     base_cmd = "Get-ChildItem"; params = []; post_cmds = []
-    params.extend([shlex.quote(p) for p in parsed_args.paths])
+    
+    # Access parsed_args.paths. It SHOULD exist now.
+    # If parsed_args.paths was an empty list (e.g. user just typed 'ls'), it will use the default=['.']
+    paths_to_list = parsed_args.paths 
+    # The default=['.'] in add_argument ensures parsed_args.paths is never None
+    # and will be ['.'] if the user provides no path arguments.
+    
+    params.extend([shlex.quote(p) for p in paths_to_list])
+
     if parsed_args.all: params.append("-Force")
     if parsed_args.recursive: params.append("-Recurse")
 
     sort_prop = None
-    sort_desc = False
+    sort_desc = False 
     if parsed_args.t: sort_prop = "LastWriteTime"
     if parsed_args.S: sort_prop = "Length"
+
     if sort_prop:
         sort_cmd = f"Sort-Object -Property {sort_prop}"
-        # Default PS sort is ascending. Linux -t/-S default is descending.
-        # -r reverses the sort direction.
         if not parsed_args.reverse: sort_desc = True
         if sort_desc: sort_cmd += " -Descending"
         post_cmds.append(sort_cmd)
-    elif parsed_args.reverse: # Reverse default name sort
+    elif parsed_args.reverse: 
         post_cmds.append("Sort-Object -Property Name -Descending")
 
     if parsed_args.l:
-         # Try a more detailed Format-Table similar to ls -l
-         # Mode, Links(N/A), Owner, Group(N/A), Size, Date, Name
          format_expression = (
             '@{N="Mode";E={($_.Mode -replace "-","").PadRight(10)}}, '
             '@{N="Owner";E={(Get-Acl $_.FullName).Owner}}, '
@@ -229,133 +280,129 @@ def translate_ls(args: list[str]) -> str | None:
             '@{N="Name";E={$_.Name}}'
          )
          post_cmds.append(f"Format-Table {format_expression} -AutoSize")
-    # else: Default format is fine
 
     full_cmd = f"{base_cmd} {' '.join(params)}"
     if post_cmds: full_cmd += " | " + " | ".join(post_cmds)
-    return full_cmd
+    return full_cmd, False
 
-def translate_cp(args: list[str]) -> str | None:
+def translate_cp(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='cp', add_help=False); parser.add_argument('-r', '-R', '--recursive', action='store_true'); parser.add_argument('-i', '--interactive', action='store_true'); parser.add_argument('-v', '--verbose', action='store_true'); parser.add_argument('-f', '--force', action='store_true'); parser.add_argument('source', nargs='+'); parser.add_argument('destination')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"cp: {e}"); return NO_EXEC_MARKER + "cp failed"
+    except ValueError as e: ui_manager.display_error(f"cp: {e}"); return NO_EXEC_MARKER + "cp failed", False # Return tuple
     base_cmd = "Copy-Item"; params = [];
     if parsed_args.recursive: params.append("-Recurse")
     if parsed_args.force: params.append("-Force")
-    elif parsed_args.interactive: params.append("-Confirm")
+    elif parsed_args.interactive: params.append("-Confirm") # PowerShell -Confirm is not exactly like Linux -i
     if parsed_args.verbose: params.append("-Verbose")
-    # Handle multiple sources to single destination directory
-    if len(parsed_args.source) > 1 and not os.path.isdir(parsed_args.destination):
-         ui_manager.display_error("cp: target must be a directory when copying multiple files")
-         return NO_EXEC_MARKER + "cp failed: target not directory"
-    params.extend([f"-Path {shlex.quote(src)}" for src in parsed_args.source])
+    
+    sources_str = ", ".join([f'"{shlex.quote(src)}"' for src in parsed_args.source])
+    params.append(f"-Path {sources_str}") # Pass sources as a comma-separated list of quoted strings
     params.append(f"-Destination {shlex.quote(parsed_args.destination)}")
-    return f"{base_cmd} {' '.join(params)}"
+    
+    # Handle multiple sources to single destination directory check (runtime PowerShell if needed, or pre-check)
+    # For simplicity, PowerShell handles this fairly well if destination is a dir. If not, it errors.
+    # The check if len(parsed_args.source) > 1 and not os.path.isdir(parsed_args.destination) can be kept.
+    if len(parsed_args.source) > 1:
+        is_dest_dir_check_ps = f"if (-not (Test-Path -Path {shlex.quote(parsed_args.destination)} -PathType Container)) {{ Write-Error 'cp: target must be a directory when copying multiple files'; exit 1; }} ; "
+        final_cmd = f"{is_dest_dir_check_ps} {base_cmd} {' '.join(params)}"
+    else:
+        final_cmd = f"{base_cmd} {' '.join(params)}"
 
-def translate_mv(args: list[str]) -> str | None:
+    return final_cmd, False
+
+def translate_mv(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='mv', add_help=False); parser.add_argument('-i', '--interactive', action='store_true'); parser.add_argument('-v', '--verbose', action='store_true'); parser.add_argument('-f', '--force', action='store_true'); parser.add_argument('source'); parser.add_argument('destination')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"mv: {e}"); return NO_EXEC_MARKER + "mv failed"
+    except ValueError as e: ui_manager.display_error(f"mv: {e}"); return NO_EXEC_MARKER + "mv failed", False # Return tuple
     base_cmd = "Move-Item"; params = []
     if parsed_args.force: params.append("-Force")
     elif parsed_args.interactive: params.append("-Confirm")
     if parsed_args.verbose: params.append("-Verbose")
     params.append(f"-Path {shlex.quote(parsed_args.source)}")
     params.append(f"-Destination {shlex.quote(parsed_args.destination)}")
-    return f"{base_cmd} {' '.join(params)}"
+    return f"{base_cmd} {' '.join(params)}", False
 
-def translate_rm(args: list[str]) -> str | None:
+def translate_rm(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='rm', add_help=False); parser.add_argument('-r', '-R', '--recursive', action='store_true'); parser.add_argument('-f', '--force', action='store_true'); parser.add_argument('-i', '--interactive', action='store_true'); parser.add_argument('-v', '--verbose', action='store_true'); parser.add_argument('files', nargs='+')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"rm: {e}"); return NO_EXEC_MARKER + "rm failed"
+    except ValueError as e: ui_manager.display_error(f"rm: {e}"); return NO_EXEC_MARKER + "rm failed", False # Return tuple
     base_cmd = "Remove-Item"; params = []
     if parsed_args.recursive: params.append("-Recurse")
     if parsed_args.force: params.append("-Force")
     elif parsed_args.interactive: params.append("-Confirm")
     if parsed_args.verbose: params.append("-Verbose")
-    params.extend([shlex.quote(f) for f in parsed_args.files])
-    # Basic safety check - don't easily allow removing C:\ or similar without -rf
-    # This is not foolproof
+    
+    # Quote each file path individually for Remove-Item
+    paths_to_remove = [shlex.quote(f) for f in parsed_args.files]
+    params.append(f"-Path {','.join(paths_to_remove)}") # Join with comma for multiple paths
+
     for f in parsed_args.files:
         abs_path = os.path.abspath(f)
         drive = os.path.splitdrive(abs_path)[0].upper() + "\\"
         if abs_path == drive and not (parsed_args.recursive and parsed_args.force):
             ui_manager.display_error(f"rm: Refusing to remove root directory '{abs_path}' without -rf")
-            return NO_EXEC_MARKER + "rm protection"
-    return f"{base_cmd} {' '.join(params)}"
+            return NO_EXEC_MARKER + "rm protection", False # Return tuple
+    return f"{base_cmd} {' '.join(params)}", False
 
-def translate_mkdir(args: list[str]) -> str | None:
+def translate_mkdir(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='mkdir', add_help=False); parser.add_argument('-p', '--parents', action='store_true'); parser.add_argument('-v', '--verbose', action='store_true'); parser.add_argument('directories', nargs='+')
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"mkdir: {e}"); return NO_EXEC_MARKER + "mkdir failed"
+    except ValueError as e: ui_manager.display_error(f"mkdir: {e}"); return NO_EXEC_MARKER + "mkdir failed", False # Return tuple
     base_cmd = "New-Item -ItemType Directory"; params = []
-    if parsed_args.parents: params.append("-Force") # -Force creates parents
+    if parsed_args.parents: params.append("-Force") 
     if parsed_args.verbose: params.append("-Verbose")
-    # New-Item can take multiple paths if separated, but let's stick to semicolon loop for clarity
-    commands = [f"{base_cmd} {' '.join(params)} -Path {shlex.quote(directory)}" for directory in parsed_args.directories]
-    return " ; ".join(commands)
+    
+    # New-Item can take an array of paths directly for -Path parameter
+    quoted_dirs = [shlex.quote(d) for d in parsed_args.directories]
+    params.append(f"-Path {','.join(quoted_dirs)}")
 
-def translate_pwd(args: list[str]) -> str | None:
-    if args: ui_manager.display_error("pwd: does not support arguments."); return NO_EXEC_MARKER + "pwd failed"
-    # Get-Location gives object, $PWD gives string directly often
-    # return "Get-Location | Select-Object -ExpandProperty Path"
-    return "Write-Host $PWD.Path" # Simpler, more direct
+    return f"{base_cmd} {' '.join(params)}", False
 
-def translate_touch(args: list[str]) -> str | None:
+def translate_pwd(args: list[str]) -> tuple[str | None, bool]:
+    if args: ui_manager.display_error("pwd: does not support arguments."); return NO_EXEC_MARKER + "pwd failed", False # Return tuple
+    return "Write-Host $PWD.Path", False
+
+def translate_touch(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='touch', add_help=False); parser.add_argument('files', nargs='+')
-    # TODO: Add flags like -t timestamp, -d date, -r reference_file
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"touch: {e}"); return NO_EXEC_MARKER + "touch failed"
+    except ValueError as e: ui_manager.display_error(f"touch: {e}"); return NO_EXEC_MARKER + "touch failed", False # Return tuple
     commands = []
-    timestamp = "Get-Date" # Default to now
-    # Add flag handling here if implementing time specification
-    for file in parsed_args.files:
-        quoted_file = shlex.quote(file)
-        # Using New-Item is safer than Set-Content as it won't clear the file
-        cmd = (f"if (-not (Test-Path {quoted_file})) {{ New-Item -Path {quoted_file} -ItemType File -Force | Out-Null }}; "
-               f"(Get-Item {quoted_file}).LastWriteTime = ({timestamp})")
+    timestamp = "Get-Date" 
+    for file_path_str in parsed_args.files:
+        quoted_file = shlex.quote(file_path_str)
+        cmd = (f"if (-not (Test-Path {quoted_file})) {{ New-Item -Path {quoted_file} -ItemType File -Force -ErrorAction SilentlyContinue | Out-Null }} else {{ (Get-Item {quoted_file}).LastWriteTime = ({timestamp}) }}")
         commands.append(cmd)
-    return " ; ".join(commands)
+    return " ; ".join(commands), False
 
-def translate_find(args: list[str]) -> str | None:
-    """Translates basic find commands to Get-ChildItem."""
+def translate_find(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='find', add_help=False)
     parser.add_argument('path', nargs='?', default='.', help='Starting path')
     parser.add_argument('-name', help='Filter by name (wildcards allowed)')
     parser.add_argument('-iname', help='Case-insensitive name filter')
     parser.add_argument('-type', choices=['f', 'd'], help='Filter by type (f=file, d=directory)')
-    # parser.add_argument('-print', action='store_true', help='Print names (default)') # Implicit
-    # parser.add_argument('-delete', action='store_true') # Potentially dangerous, map to | Remove-Item
-    # parser.add_argument('-exec', nargs='+') # Very complex to map securely
-
     try: parsed_args = parser.parse_args(args)
-    except ValueError as e: ui_manager.display_error(f"find: {e}"); return NO_EXEC_MARKER + "find failed"
+    except ValueError as e: ui_manager.display_error(f"find: {e}"); return NO_EXEC_MARKER + "find failed", False # Return tuple
 
     base_cmd = "Get-ChildItem"
-    params = [f"-Path {shlex.quote(parsed_args.path)}", "-Recurse"]
+    params = [f"-Path {shlex.quote(parsed_args.path)}", "-Recurse", "-ErrorAction SilentlyContinue"] # Added SilentlyContinue
     post_cmds = []
 
     name_filter = None
     if parsed_args.name:
         name_filter = parsed_args.name
     elif parsed_args.iname:
-        name_filter = parsed_args.iname # PS filter is case-insensitive by default
+        name_filter = parsed_args.iname 
 
     if name_filter:
-        params.append(f"-Filter {shlex.quote(name_filter)}") # Use -Filter for efficiency if possible
+        params.append(f"-Filter {shlex.quote(name_filter)}")
 
     if parsed_args.type:
-        if parsed_args.type == 'f':
-            params.append("-File")
-        elif parsed_args.type == 'd':
-            params.append("-Directory")
-
-    # if parsed_args.delete:
-    #    post_cmds.append("Remove-Item -Force -Recurse") # Be careful with this!
-
+        if parsed_args.type == 'f': params.append("-File")
+        elif parsed_args.type == 'd': params.append("-Directory")
+    
     full_cmd = f"{base_cmd} {' '.join(params)}"
-    if post_cmds: full_cmd += " | " + " | ".join(post_cmds)
-    return full_cmd
+    if post_cmds: full_cmd += " | " + " | ".join(post_cmds) # post_cmds currently unused but kept for future
+    return full_cmd, False
 
 # === Permissions ===
 def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
@@ -558,13 +605,89 @@ def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
     final_command_str = " ; ".join(all_commands)
     return final_command_str, needs_elevation
 
-def translate_chown(args: list[str]) -> str | None:
-    ui_manager.display_error("chown: Changing ownership is complex and differs significantly on Windows.")
-    ui_manager.display_info("Use 'icacls <file> /setowner <user>' or Get-Acl/Set-Acl in PowerShell (may require admin rights).")
-    return NO_EXEC_MARKER + "chown not supported"
+def translate_chown(args: list[str]) -> tuple[str | None, bool]:
+    ui_manager.display_warning("chown translation is approximate. Windows ownership and group concepts differ from POSIX. Elevation is required.")
+
+    parser = NonExitingArgumentParser(prog='chown', add_help=False)
+    parser.add_argument('-R', '--recursive', action='store_true')
+    parser.add_argument('owner_group', help="Owner or Owner:Group (e.g., 'Administrator', 'MyUser:Users')")
+    parser.add_argument('files', nargs='+', help='File(s) or directory(s)')
+
+    try:
+        parsed_args = parser.parse_args(args)
+    except ValueError as e:
+        ui_manager.display_error(f"chown: {e}")
+        return NO_EXEC_MARKER + f"chown failed: {e}", False
+
+    owner_spec = parsed_args.owner_group
+    new_owner = owner_spec
+    new_group = None
+
+    if ':' in owner_spec:
+        new_owner, new_group = owner_spec.split(':', 1)
+        if not new_owner: # e.g., ":group" means change only group, keep owner. This is hard.
+            ui_manager.display_error("chown: Changing only group (e.g., ':group') is not directly supported in this translation.")
+            return NO_EXEC_MARKER + "chown group-only change not supported", False
+    elif '.' in owner_spec: # Common alternative e.g. user.group
+        new_owner, new_group = owner_spec.split('.', 1)
+        if not new_owner:
+            ui_manager.display_error("chown: Changing only group (e.g., '.group') is not directly supported in this translation.")
+            return NO_EXEC_MARKER + "chown group-only change not supported", False
+
+
+    commands = []
+    recursive_opt = "/T" if parsed_args.recursive else ""
+    # For /setowner to recurse on subfolders, it also needs /C (continue on error) for files where ownership can't be changed.
+    # However, /T with /setowner is for subfolders. For files within folders, it applies to the folder.
+    # The behavior of chown -R is to change files AND directories.
+    # icacls /setowner /T applies to the directory and its sub-items if they inherit.
+    # A loop might be more accurate for -R: Get-ChildItem -Recurse | ForEach-Object { icacls $_.FullName ... }
+
+    ps_loop_prefix = ""
+    ps_loop_suffix = ""
+    file_placeholder = "{file_placeholder}" # Default for single file
+
+    if parsed_args.recursive and len(parsed_args.files) == 1 and os.path.isdir(parsed_args.files[0]):
+        # If -R and single directory target, icacls /setowner can handle recursion somewhat.
+        # But for robust file/folder recursion, a PS loop is better.
+        # Let's stick to simpler icacls /T for directories for now.
+        # For mixed files/dirs or multiple targets with -R, it's complex.
+        pass # recursive_opt already set to /T
+    elif parsed_args.recursive:
+        # More complex -R scenario: multiple targets or files mixed with dirs.
+        # For simplicity, this translation will apply /setowner with /T to each named item.
+        # If an item is a file, /T is ignored. If a dir, it applies to sub-items.
+        ui_manager.display_warning("chown -R: Recursive behavior with multiple/mixed targets is simplified for icacls.")
+
+
+    if new_owner:
+        # It's crucial that `new_owner` is a valid user/group name or SID known to the system.
+        # Examples: "Administrator", "BUILTIN\\Administrators", "DOMAIN\\User"
+        commands.append(f"icacls {file_placeholder} {recursive_opt} /setowner {shlex.quote(new_owner)} /C") # /C to continue on errors
+
+    if new_group:
+        ui_manager.display_warning(f"chown: Translating group to '{new_group}' by granting Full Control (F) via icacls. This is not a direct group ownership change.")
+        # Granting Full Control to the new "group".
+        # (OI)(CI) for inheritance if it's a directory.
+        inheritance_str = ""
+        # This check should be inside the loop if using PowerShell loop.
+        # For now, apply generally if -R.
+        if parsed_args.recursive: inheritance_str = "(OI)(CI)"
+        commands.append(f"icacls {file_placeholder} {recursive_opt} /grant {shlex.quote(new_group)}:({inheritance_str}F) /C")
+
+    if not commands:
+        return NO_EXEC_MARKER + "chown: No actions determined from owner/group spec.", False
+
+    final_file_commands = []
+    for f_path in parsed_args.files:
+        quoted_f = shlex.quote(f_path)
+        for cmd_template in commands:
+            final_file_commands.append(cmd_template.format(file_placeholder=quoted_f))
+
+    return " ; ".join(final_file_commands), True # Elevation always assumed for chown
 
 # === Text Processing ===
-def translate_cat(args: list[str]) -> str | None:
+def translate_cat(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='cat', add_help=False)
     parser.add_argument('-n', '--number', action='store_true', help='Number output lines')
     parser.add_argument('files', nargs='*') # Allow reading from stdin if no files
@@ -783,41 +906,84 @@ def translate_df(args: list[str]) -> tuple[str | None, bool]:
 def translate_ps(args: list[str]) -> tuple[str | None, bool]:
     """Translates ps to Get-Process."""
     parser = NonExitingArgumentParser(prog='ps', add_help=False)
-    parser.add_argument('ax', nargs='?', help='Common combined flag ax')
+    # Add common combinations like 'aux' as nargs='?' to consume them if present
+    # but not make them mandatory parts of a specific flag.
+    parser.add_argument('ax', nargs='?', help='Common combined flag ax or other non-flag args')
+    parser.add_argument('aux', nargs='?', help='Common combined flag aux')
+
     parser.add_argument('-e', '-A', action='store_true', help='Select all processes')
     parser.add_argument('-f', action='store_true', help='Full format listing (more details)')
     parser.add_argument('-u', action='store_true', help='User-oriented format (show user)')
-    parser.add_argument('x', nargs='?', help='Ignored x flag often used with a')
+    # 'x' is often used with 'a', if 'ax' or 'aux' is passed, it implies 'x' functionality
+    # No separate -x flag needed as Get-Process is broad.
 
-    raw_args_str = "".join(args)
-    show_all = '-e' in raw_args_str or '-A' in raw_args_str or 'a' in raw_args_str
-    full_format = '-f' in raw_args_str
-    user_format = '-u' in raw_args_str
+    try:
+        # We parse known args, and then inspect the 'ax' or 'aux' positional arguments
+        # if they were used, to infer combined flags.
+        parsed_args, remaining_args = parser.parse_known_args(args)
+        # Treat remaining_args as potential combined flags like 'aux'
+        # This is simpler than trying to define every combination in argparse.
+        raw_flags_from_remaining = "".join(remaining_args)
+        if parsed_args.ax: raw_flags_from_remaining += parsed_args.ax
+        if parsed_args.aux: raw_flags_from_remaining += parsed_args.aux
+
+    except ValueError as e:
+        ui_manager.display_error(f"ps: {e}")
+        return NO_EXEC_MARKER + "ps failed", False
+
+    show_all_heuristic = parsed_args.e or parsed_args.A or 'a' in raw_flags_from_remaining
+    user_format_heuristic = parsed_args.u or 'u' in raw_flags_from_remaining
+    full_format_heuristic = parsed_args.f or 'f' in raw_flags_from_remaining # 'f' usually implies wider output
+    invoked_with_x_heuristic = 'x' in raw_flags_from_remaining
+
+    if invoked_with_x_heuristic:
+        ui_manager.display_info("ps: 'x' flag (processes without tty) is effectively default with Get-Process.")
 
     base_cmd = "Get-Process"
-    params = ["-ErrorAction SilentlyContinue"] # Ignore errors for processes that disappear
-    format_cmd = "| Format-Table -AutoSize" # Default table
+    params = ["-ErrorAction SilentlyContinue"]
+    format_cmd = "| Format-Table -AutoSize"
+    needs_elevation = False # Default
 
-    properties = ["Id", "ProcessName"] # Minimal default
-    if full_format or user_format:
-        properties = ["Id", "Handles", "CPU", "SI", "WS", "ProcessName"]
-    if user_format:
-        # Getting username can require elevation or be slow. Use IncludeUserName parameter.
+    properties = ["Id", "ProcessName", "CPU", "WS"] # Default set
+
+    if user_format_heuristic:
         params.append("-IncludeUserName")
-        properties = ["UserName", "Id", "CPU", "StartTime", "ProcessName"]
-        format_cmd = "| Format-Table UserName, Id, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, @{N='START';E={$_.StartTime.ToString('HH:mm')}}, ProcessName -AutoSize"
-        needs_elevation = True # IncludeUserName often needs elevation
-        return f"{base_cmd} {' '.join(params)} {format_cmd}", needs_elevation
-    elif full_format:
-        properties = ["Id", "Handles", "CPU", "WS", "Path"]
-        format_cmd = "| Format-Table Id, Handles, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, @{N='WS(MB)';E={[math]::Round($_.WS / 1MB)}}, Path -AutoSize"
+        # User, PID, %CPU, %MEM, VSZ, RSS, TTY, STAT, START, TIME, COMMAND
+        # Mapping: UserName, Id, CPU, PM (PagedMemorySize64/1MB), VM (VirtualMemorySize64/1MB), Path
+        properties = [
+            "@{N='USER';E={$_.UserName}}",
+            "@{N='PID';E={$_.Id}}",
+            "@{N='CPU';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}",
+            "@{N='MEM';E={if($_.WS -ne $null){[math]::Round($_.WS / (Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize * 100, 1)}else{0}}}", # %MEM approx
+            "@{N='VSZ(MB)';E={[math]::Round($_.VM / 1MB)}}",
+            "@{N='RSS(MB)';E={[math]::Round($_.WS / 1MB)}}", # WS is resident set
+            # TTY, STAT not directly available
+            "@{N='START';E={$_.StartTime.ToString('HH:mm:ss')}}",
+            # TIME (CPU time) is $_.CPU (total seconds), format it if desired
+            "@{N='COMMAND';E={$_.Path}}",
+        ]
+        format_cmd = f"| Format-Table {','.join(properties)} -AutoSize"
+        needs_elevation = True
+    elif full_format_heuristic: # 'ps -f' often shows UID, PID, PPID, C, STIME, TTY, TIME, CMD
+        params.append("-IncludeUserName") # For UID (UserName)
+        properties = [
+            "@{N='UID';E={$_.UserName}}",
+            "@{N='PID';E={$_.Id}}",
+            "@{N='PPID';E={(Get-CimInstance Win32_Process -Filter ('ProcessId=' + $_.Id)).ParentProcessId}}", # PPID is expensive
+            # C (processor utilization short term) - CPU is more like total CPU time
+            "@{N='STIME';E={$_.StartTime.ToString('HH:mm')}}",
+            # TTY not available
+            "@{N='TIME';E={if($_.CPU -ne $null){$ts = [System.TimeSpan]::FromSeconds($_.CPU); '{0:D2}:{1:D2}:{2:D2}' -f $ts.Hours, $ts.Minutes, $ts.Seconds}else{'00:00:00'}}}",
+            "@{N='CMD';E={$_.ProcessName + ' ' + $_.CommandLine}}", # CommandLine can be null/require elevation
+        ]
+        format_cmd = f"| Format-Table {','.join(properties)} -AutoSize"
+        needs_elevation = True # Due to IncludeUserName and potentially CommandLine/PPID access
+    else: # Default for 'ps' or 'ps a', 'ps x' etc.
+        properties = ["Id", "ProcessName", "@{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}", "@{N='WS(MB)';E={[math]::Round($_.WS / 1MB)}}"]
+        format_cmd = f"| Select-Object {','.join(properties)} | Format-Table -AutoSize"
+        # No elevation needed for this basic set unless system processes are restricted by default UAC.
 
-    if not full_format and not user_format:
-         properties = ["Id", "ProcessName", "CPU", "WS"]
-         format_cmd = "| Format-Table Id, ProcessName, @{N='CPU(s)';E={if($_.CPU -ne $null){[math]::Round($_.CPU,2)}else{0}}}, @{N='WS(MB)';E={[math]::Round($_.WS / 1MB)}} -AutoSize"
-
-    # Default ps doesn't need elevation unless -u is used
-    return f"{base_cmd} {' '.join(params)} | Select-Object {','.join(properties)} {format_cmd}", False
+    return f"{base_cmd} {' '.join(params)} {format_cmd}", needs_elevation
 
 
 def translate_kill(args: list[str]) -> tuple[str | None, bool]:
@@ -965,71 +1131,82 @@ def translate_curl(args: list[str]) -> tuple[str | None, bool]: return translate
 
 # === Package Management & OS ===
 def translate_apt(args: list[str]) -> tuple[str | None, bool]:
-    # Assume the previous robust apt parser implementation is here...
     parser = NonExitingArgumentParser(prog='apt/apt-get/dnf/yum/pacman/zypper', add_help=False); subparsers = parser.add_subparsers(dest='subcommand', help='Sub-command help')
-    subparsers.add_parser('update'); upg = subparsers.add_parser('upgrade'); upg.add_argument('packages', nargs='*'); inst = subparsers.add_parser('install'); inst.add_argument('packages', nargs='+'); inst.add_argument('-y', '--yes', action='store_true'); rem = subparsers.add_parser('remove'); rem.add_argument('packages', nargs='+'); rem.add_argument('-y', '--yes', action='store_true'); purg = subparsers.add_parser('purge'); purg.add_argument('packages', nargs='+'); purg.add_argument('-y', '--yes', action='store_true'); srch = subparsers.add_parser('search'); srch.add_argument('query', nargs='+'); sh = subparsers.add_parser('show'); sh.add_argument('package')
-    # Add aliases
-    aliases = {'add': 'install', '-S': 'install', 'delete': 'remove', 'erase': 'remove', 'list': 'list', 'info': 'show'} # Added list/info
+    # (subparser setup remains the same)
+    subparsers.add_parser('update'); upg = subparsers.add_parser('upgrade'); upg.add_argument('packages', nargs='*'); upg.add_argument('-y', '--yes', action='store_true'); inst = subparsers.add_parser('install'); inst.add_argument('packages', nargs='+'); inst.add_argument('-y', '--yes', action='store_true'); rem = subparsers.add_parser('remove'); rem.add_argument('packages', nargs='+'); rem.add_argument('-y', '--yes', action='store_true'); purg = subparsers.add_parser('purge'); purg.add_argument('packages', nargs='+'); purg.add_argument('-y', '--yes', action='store_true'); srch = subparsers.add_parser('search'); srch.add_argument('query', nargs='+'); sh = subparsers.add_parser('show'); sh.add_argument('package')
+    list_parser = subparsers.add_parser('list'); list_parser.add_argument('packages', nargs='*') # Add list explicitly
 
-    cmd_name = parser.prog.split('/')[0] # Get original command name
+    aliases = {'add': 'install', 'delete': 'remove', 'erase': 'remove', 'info': 'show'}
 
-    # Pre-process args for aliases like pacman -S etc.
-    processed_args = list(args) # Make a copy
+    cmd_name = parser.prog.split('/')[0] 
+
+    processed_args = list(args)
     if processed_args:
-        potential_alias = processed_args[0]
-        if potential_alias in aliases:
-            processed_args[0] = aliases[potential_alias] # Replace alias with standard subcommand
-        elif cmd_name == 'pacman' and potential_alias == '-Syu': # Handle common combo
-            processed_args = ['upgrade'] # Treat -Syu as upgrade --all
-        elif cmd_name == 'pacman' and potential_alias == '-S':
-            processed_args = ['install'] + processed_args[1:]
-        elif cmd_name == 'pacman' and potential_alias == '-R':
-            processed_args = ['remove'] + processed_args[1:]
-        elif cmd_name == 'pacman' and potential_alias == '-Ss':
-            processed_args = ['search'] + processed_args[1:]
-        # Add more specific mappings for other package managers if needed
+        potential_alias_cmd = processed_args[0]
+        if potential_alias_cmd in aliases:
+            processed_args[0] = aliases[potential_alias_cmd]
+        elif cmd_name == 'pacman':
+            if potential_alias_cmd == '-Syu': processed_args = ['upgrade']
+            elif potential_alias_cmd == '-S': processed_args = ['install'] + processed_args[1:]
+            elif potential_alias_cmd == '-Rns': processed_args = ['remove'] + processed_args[1:] # Common pacman remove
+            elif potential_alias_cmd == '-R': processed_args = ['remove'] + processed_args[1:]
+            elif potential_alias_cmd == '-Ss': processed_args = ['search'] + processed_args[1:]
+            elif potential_alias_cmd == '-Qs': processed_args = ['list'] + processed_args[1:] # Pacman list installed
+            elif potential_alias_cmd == '-Q': processed_args = ['list'] # Pacman list all installed (approx.)
+        # Add dnf/yum list installed -> winget list
+        elif cmd_name in ['dnf', 'yum'] and processed_args == ['list', 'installed']:
+            processed_args = ['list']
+
 
     try:
-        if not processed_args or processed_args[0] not in subparsers.choices and processed_args[0] != 'list': # Allow list as special case
+        if not processed_args or processed_args[0] not in subparsers.choices:
             subcmd_guess = processed_args[0] if processed_args else ''
-            ui_manager.display_error(f"{cmd_name}: Unknown or missing subcommand: '{subcmd_guess}'");
-            return "winget --help", False # Show winget help
-        # Handle 'list' command separately if needed, or add it to parser
-        if processed_args[0] == 'list':
-             # winget list doesn't usually need elevation
-             return "winget list", False
-        # Proceed with parsing if subcommand is recognized
-        parsed_args = parser.parse_args(processed_args)
+            # Allow common 'list' variations without being strict subcommands if they map simply
+            if subcmd_guess == 'list' or (cmd_name in ['dnf', 'yum'] and " ".join(processed_args).startswith("list installed")):
+                 # Special handling for 'list' if it wasn't caught by pacman -Qs etc.
+                 parsed_args = argparse.Namespace(subcommand='list', packages=[]) # Simulate parse
+            else:
+                ui_manager.display_error(f"{cmd_name}: Unknown or missing subcommand: '{subcmd_guess}'");
+                return "winget --help", False 
+        else:
+            parsed_args = parser.parse_args(processed_args)
     except ValueError as e: ui_manager.display_error(f"{cmd_name}: {e}"); return NO_EXEC_MARKER + f"{cmd_name} failed", False
 
     base_cmd="winget"; subcmd=parsed_args.subcommand; params=[]; accept=False
-    needs_elevation = True # Default, most winget read commands are fine
+    needs_elevation = False # Default for read-only winget commands
 
     if subcmd == 'update':
-        params.append("source update") # Updating sources
+        params.append("source update") 
+        needs_elevation = True # Updating sources often needs elevation for cache write
     elif subcmd == 'upgrade':
         params.append("upgrade"); accept=getattr(parsed_args,'yes',False);
         if parsed_args.packages: params.extend([shlex.quote(p) for p in parsed_args.packages])
         else: params.append("--all")
-        needs_elevation = True # Upgrading packages needs elevation
+        needs_elevation = True 
     elif subcmd == 'install':
         params.append("install"); params.extend([shlex.quote(p) for p in parsed_args.packages]); accept=getattr(parsed_args,'yes',False)
-        needs_elevation = True # Installing packages needs elevation
+        needs_elevation = True
     elif subcmd in ['remove','purge']:
         params.append("uninstall"); params.extend([shlex.quote(p) for p in parsed_args.packages]); accept=getattr(parsed_args,'yes',False)
-        needs_elevation = True # Uninstalling packages needs elevation
+        needs_elevation = True
     elif subcmd == 'search':
         params.append("search"); params.append(shlex.quote(" ".join(parsed_args.query)))
+        # needs_elevation = False (default)
     elif subcmd == 'show':
         params.append("show"); params.append(shlex.quote(parsed_args.package))
+        # needs_elevation = False (default)
+    elif subcmd == 'list':
+        params.append("list")
+        if hasattr(parsed_args, 'packages') and parsed_args.packages:
+            params.extend([shlex.quote(p) for p in parsed_args.packages]) # Filter by package name if provided
+        # needs_elevation = False (default)
     else:
-        # Should not be reached if parsing worked
         return f"winget {subcmd} # (Passthrough)", False
 
     if accept: params.extend(["--accept-package-agreements", "--accept-source-agreements"])
+    if subcmd not in ['search', 'show', 'list', 'update']: # These commands don't need --disable-interactivity usually
+        params.append("--disable-interactivity")
 
-    # Add verbose flag and update help command too
-    params.append("--disable-interactivity")
 
     return f"{base_cmd} {' '.join(params)}"
 

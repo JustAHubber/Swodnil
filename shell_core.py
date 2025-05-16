@@ -435,19 +435,39 @@ def run_shell():
 
                 if isinstance(translation_result, str):
                     if translation_result.startswith(SIMULATION_MARKER_PREFIX):
-                        is_problematic_sequence_for_sim = (
-                            (len(parsed_commands) > 1 and (separator is not None and separator != Separator.BACKGROUND)) or
-                            (cmd_index > 0 and parsed_commands[cmd_index-1][1] == Separator.PIPE)
-                        )
-                        if is_problematic_sequence_for_sim:
-                            ui_manager.display_error(f"Simulation '{command}' is invalid in this command sequence context.")
-                            pipeline_failed_for_and = True;
-                        else:
-                            is_segment_simulated_and_standalone_valid = True
-                            # Simulation runs when command_translator.process_command is called.
-                            # It does not add to current_pipeline_segments_translated.
+                        # ... (simulation logic) ...
+                        is_segment_simulated_and_standalone_valid = True
+
                     elif translation_result.startswith(NO_EXEC_MARKER):
-                        pipeline_failed_for_and = True # Message already displayed by translator
+                        # --- REVISED HELP DISPLAY LOGIC ---
+                        # New convention: NO_EXEC_MARKER + "SWODNIL_HELP_MESSAGE:" + actual_help_text
+                        help_marker_convention = "SWODNIL_HELP_MESSAGE:"
+                        full_no_exec_content = translation_result[len(NO_EXEC_MARKER):]
+
+                        if full_no_exec_content.startswith(help_marker_convention):
+                            actual_help_text = full_no_exec_content[len(help_marker_convention):].strip()
+                            from rich.panel import Panel
+                            from rich.text import Text
+                            panel_title = f"Help: {command}"
+                            ui_manager.console.print(
+                                Panel(
+                                    Text.from_markup(actual_help_text), 
+                                    title=panel_title, 
+                                    border_style="green",
+                                    padding=(1,1) # Adjusted padding
+                                )
+                            )
+                        else:
+                            # Original NO_EXEC_MARKER behavior (e.g. error message or guide)
+                            # These are often already printed by ui_manager within the translator.
+                            # Or if not, the content_after_marker might be a simple message.
+                            # For example, chmod might print its own warnings via ui_manager,
+                            # then return NO_EXEC_MARKER + "chmod warning displayed".
+                            # We don't want to re-print that.
+                            # So, if it's not help, we generally do nothing here for NO_EXEC.
+                            pass 
+                        # --- END OF REVISED HELP DISPLAY LOGIC ---
+                        pipeline_failed_for_and = True # Stop further execution for this segment
                     else: # Regular PowerShell command string
                         current_pipeline_segments_translated.append(translation_result)
                 elif translation_result is None: # Native command, pass as is
