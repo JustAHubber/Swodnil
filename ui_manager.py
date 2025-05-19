@@ -110,7 +110,7 @@ def display_warning(message: str):
 
 def display_info(message: str):
     """Displays an internal informational message from Swodnil itself."""
-    console.print(f"[purple]{message}[/purple]") # Purple theme
+    console.print(f"[lightblue]{message}[/lightblue]") # Purple theme
 
 def display_list(items: list[str], title: str = "Items"):
     """Displays a list of items, possibly in a table for better formatting."""

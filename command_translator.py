@@ -518,13 +518,13 @@ def translate_find(args: list[str]) -> tuple[str | None, bool]:
     return full_cmd, False
 
 # === Permissions ===
-def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
+# def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='chmod', add_help=False)
     parser.add_argument('--help', action='store_true', help='Show Swodnil help for chmod')
     parser.add_argument('-h', dest='help_short', action='store_true', help='Alias for --help')
     parser.add_argument('-R', '--recursive', action='store_true')
-    parser.add_argument('mode', nargs='?') # Optional for help
-    parser.add_argument('files', nargs='*') # Optional for help
+    parser.add_argument('mode', nargs='?') 
+    parser.add_argument('files', nargs='*')
     try: parsed_args = parser.parse_args(args)
     except ValueError as e: return NO_EXEC_MARKER + f"chmod: {e}", False
 
@@ -540,7 +540,8 @@ def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
   chmod [options] <mode> <file ...>
 
 [cyan]Supported Modes (basic mapping):[/cyan]
-  Symbolic (e.g., u+x, go-r): Approximated for user, group (Authenticated Users), other (Everyone).
+  Symbolic (e.g., u+x, go-r): Approximated for user ($currentUserForIcacls via $(whoami)), 
+                              group ('Authenticated Users'), other ('Everyone').
   Numeric (e.g., 755): Very coarsely mapped to `icacls` grants.
   
 [cyan]Supported Flags:[/cyan]
@@ -548,7 +549,7 @@ def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
   --help, -h        Show this help message.
 
 [cyan]Notes:[/cyan]
-  - `icacls` changes usually need Administrator privileges. Best avoided for precise POSIX semantics.
+  - `icacls` changes usually need Administrator privileges. Ensure user/group names are valid for Windows.
 """
         return NO_EXEC_MARKER + HELP_MARKER_PREFIX + help_string.strip(), False
 
@@ -557,99 +558,135 @@ def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
     
     ui_manager.display_warning("chmod translation to icacls is limited/approximate. Elevation typically required.")
     mode_str = parsed_args.mode
-    # files_relative = parsed_args.files # Keep original relative list if needed for display/error
     recursive_opt = "/T" if parsed_args.recursive else ""
-    commands_templates = [] # Templates for icacls commands
-    current_user_ps = "$(whoami)"
-    group_sid_map = "Authenticated Users"
-    other_sid_map = "Everyone"
+    
+    prepend_cmds = [] 
+    icacls_cmd_templates = [] 
+
+    ps_var_current_user = "$currentUserForIcacls" 
+    group_sid_literal_for_icacls = "'Authenticated Users'"
+    other_sid_literal_for_icacls = "'Everyone'"      
+
+    needs_current_user_var = False
+    # Check if mode string implies targeting the current user ('u' or 'a' in symbolic, or any owner change in numeric)
+    if not re.fullmatch(r'^[0-7]{3,4}$', mode_str): # Symbolic mode
+        if 'u' in mode_str or ('a' in mode_str and not mode_str.startswith('go') and not mode_str.startswith('og')): # 'a' implies 'u' unless specifically excluding user
+            needs_current_user_var = True
+    elif re.fullmatch(r'^[0-7]{3,4}$', mode_str): # Numeric mode always involves owner
+        needs_current_user_var = True 
+    
+    if needs_current_user_var:
+        # Ensure it's added only once
+        if f"{ps_var_current_user} = $(whoami)" not in prepend_cmds:
+            prepend_cmds.append(f"{ps_var_current_user} = $(whoami)")
 
     if re.fullmatch(r'^[0-7]{3,4}$', mode_str):
         numeric_mode = mode_str[-3:]
         owner_digit, group_digit, other_digit = [int(d) for d in numeric_mode]
         ui_manager.display_warning(f"Numeric chmod mode '{mode_str}' has a VERY approximate mapping to icacls.")
-        perms_map = {7: "F", 6: "M", 5: "RX", 4: "R", 0: "N"} # N for no access (remove)
+        perms_map = {7: "F", 6: "M", 5: "RX", 4: "R", 0: "N"} 
         
-        def add_numeric_perms_template(digit, target_sid):
+        def add_numeric_perms_template(digit, target_ps_spec):
             perm_char = perms_map.get(digit)
+            # If target_ps_spec is a variable like $currentUserForIcacls, quote it for icacls argument
+            # If it's a literal like 'Authenticated Users', it's already PowerShell-quoted.
+            target_for_icacls_cmd = f'"{target_ps_spec}"' if target_ps_spec.startswith("$") else target_ps_spec
+
             if perm_char and perm_char != "N":
-                commands_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /grant {target_sid}:({perm_char})")
-            elif perm_char == "N" or digit == 0 : # Explicitly remove if 0 or mapped to N
-                commands_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /remove {target_sid}")
-            # else: unmapped digit, could warn or ignore
+                icacls_cmd_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /grant {target_for_icacls_cmd}:{perm_char}")
+            elif perm_char == "N" or digit == 0 : 
+                icacls_cmd_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /remove {target_for_icacls_cmd}")
         
-        add_numeric_perms_template(owner_digit, current_user_ps)
-        add_numeric_perms_template(group_digit, f"'{group_sid_map}'") # Quote SIDs with spaces
-        add_numeric_perms_template(other_digit, f"'{other_sid_map}'")
-    else: # Symbolic mode
+        add_numeric_perms_template(owner_digit, ps_var_current_user) # Always use the var for owner in numeric
+        add_numeric_perms_template(group_digit, group_sid_literal_for_icacls) 
+        add_numeric_perms_template(other_digit, other_sid_literal_for_icacls)
+    else: 
         ops = re.findall(r'([ugoa]*)([+\-=])([rwxXstugo]*)', mode_str)
         if not ops:
             return NO_EXEC_MARKER + f"chmod: Invalid mode string structure: '{mode_str}'", False
         
+        # Check again if current user var needs to be defined based on symbolic ops
+        if not needs_current_user_var: # If numeric didn't already set it
+            for who_chk, _, _ in ops:
+                if 'u' in who_chk or 'a' in who_chk:
+                    if f"{ps_var_current_user} = $(whoami)" not in prepend_cmds:
+                         prepend_cmds.append(f"{ps_var_current_user} = $(whoami)")
+                    needs_current_user_var = True # Mark it as needed now
+                    break 
+
         for who, op, perms_str in ops:
-            if not who: who = 'a' # Default to 'a' if not specified (like +x)
-            targets = set()
-            if 'u' in who: targets.add(current_user_ps)
-            if 'g' in who: targets.add(f"'{group_sid_map}'")
-            if 'o' in who: targets.add(f"'{other_sid_map}'")
-            if 'a' in who: targets.update([current_user_ps, f"'{group_sid_map}'", f"'{other_sid_map}'"])
+            if not who: who = 'a' 
             
-            # Map r,w,x to icacls permissions. X is complex (execute only if dir or already executable).
-            # Simplified: x -> RX.
-            ps_perms_list = [] # Build list of simple perms like R, W, X
+            icacls_targets_for_this_op = set() 
+            if 'u' in who: icacls_targets_for_this_op.add(ps_var_current_user)
+            if 'g' in who: icacls_targets_for_this_op.add(group_sid_literal_for_icacls)
+            if 'o' in who: icacls_targets_for_this_op.add(other_sid_literal_for_icacls)
+            if 'a' in who: 
+                if needs_current_user_var: icacls_targets_for_this_op.add(ps_var_current_user)
+                icacls_targets_for_this_op.add(group_sid_literal_for_icacls)
+                icacls_targets_for_this_op.add(other_sid_literal_for_icacls)
+            
+            ps_perms_list = [] 
             if 'r' in perms_str: ps_perms_list.append("R")
             if 'w' in perms_str: ps_perms_list.append("W") 
-            if 'x' in perms_str or 'X' in perms_str: ps_perms_list.append("X") # Treat X as x for simplicity
+            if 'x' in perms_str or 'X' in perms_str: ps_perms_list.append("X")
 
             effective_icacls_perm = ""
             has_r, has_w, has_x = 'R' in ps_perms_list, 'W' in ps_perms_list, 'X' in ps_perms_list
-
-            if has_r and has_w and has_x: effective_icacls_perm = "F" # Full Control
-            elif has_r and has_w: effective_icacls_perm = "M"         # Modify
-            elif has_r and has_x: effective_icacls_perm = "RX"        # Read & Execute
-            elif has_w and has_x: effective_icacls_perm = "(W,X)"     # Write, Execute
+            if has_r and has_w and has_x: effective_icacls_perm = "F" 
+            elif has_r and has_w: effective_icacls_perm = "M"         
+            elif has_r and has_x: effective_icacls_perm = "RX"        
+            elif has_w and has_x: effective_icacls_perm = "(W,X)" 
             elif has_r: effective_icacls_perm = "R"
-            elif has_w: effective_icacls_perm = "W"                   # Write Data
-            elif has_x: effective_icacls_perm = "X"                   # Execute File
+            elif has_w: effective_icacls_perm = "W"                   
+            elif has_x: effective_icacls_perm = "X"                   
 
-            if not effective_icacls_perm and perms_str: # e.g. chmod +s (sticky bit etc.)
-                ui_manager.display_warning(f"chmod: Permissions '{perms_str}' in mode '{who}{op}{perms_str}' are not fully translated to icacls.")
-                continue # Skip this specific permission part
+            if not effective_icacls_perm and perms_str: 
+                ui_manager.display_warning(f"chmod: Permissions '{perms_str}' in mode '{who}{op}{perms_str}' are not fully translated.")
+                continue 
 
-            for target_user_or_sid in targets:
+            for target_ps_spec in icacls_targets_for_this_op:
+                target_for_icacls_cmd = f'"{target_ps_spec}"' if target_ps_spec.startswith("$") else target_ps_spec
                 if op == '+':
                     if effective_icacls_perm:
-                        commands_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /grant {target_user_or_sid}:({effective_icacls_perm})")
+                        icacls_cmd_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /grant {target_for_icacls_cmd}:{effective_icacls_perm}")
                 elif op == '-':
-                    if effective_icacls_perm: # Deny specific perms
-                        commands_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /deny {target_user_or_sid}:({effective_icacls_perm})")
-                    else: # e.g. u- (remove all for user)
-                         commands_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /remove {target_user_or_sid}")
-                elif op == '=': # Set exactly these permissions
-                    # For '=', typically remove all explicit grants/denies for the target first, then grant the specified.
-                    # This is simplified here; /reset is too broad.
-                    commands_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /remove {target_user_or_sid}") # Attempt remove existing explicit ACEs
+                    if effective_icacls_perm: 
+                        icacls_cmd_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /deny {target_for_icacls_cmd}:{effective_icacls_perm}")
+                    else: 
+                         icacls_cmd_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /remove {target_for_icacls_cmd}")
+                elif op == '=': 
+                    icacls_cmd_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /remove {target_for_icacls_cmd}") 
                     if effective_icacls_perm:
-                        commands_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /grant {target_user_or_sid}:({effective_icacls_perm})")
-                    # If effective_icacls_perm is empty (e.g. u=), the /remove above handles it.
+                        icacls_cmd_templates.append(f"icacls {{file_placeholder}} {recursive_opt} /grant {target_for_icacls_cmd}:{effective_icacls_perm}")
 
-    if not commands_templates:
+    if not icacls_cmd_templates:
         return NO_EXEC_MARKER + "chmod: mode did not translate to any actionable icacls commands.", False
 
-    # Apply command templates to each file using its absolute path
-    final_file_commands = []
+    all_final_commands_for_all_files = []
     for f_path_relative in parsed_args.files:
         abs_f_path = os.path.abspath(f_path_relative)
-        quoted_abs_f = shlex.quote(abs_f_path)
-        for cmd_template in commands_templates:
-            final_file_commands.append(cmd_template.format(file_placeholder=quoted_abs_f))
+        ps_quoted_abs_f_path = f"'{abs_f_path.replace("'", "''")}'" 
+
+        for cmd_template in icacls_cmd_templates:
+            all_final_commands_for_all_files.append(cmd_template.format(file_placeholder=ps_quoted_abs_f_path))
     
-    if not final_file_commands: # Should be redundant if commands_templates check passed, but safety.
+    if not all_final_commands_for_all_files: 
         return NO_EXEC_MARKER + "chmod: no executable commands generated for any file.", False
         
-    return " ; ".join(final_file_commands), True # Assume elevation needed
+    final_script_parts = []
+    if prepend_cmds:
+        final_script_parts.extend(prepend_cmds)
+    final_script_parts.extend(all_final_commands_for_all_files)
+        
+    return " ; ".join(final_script_parts), True
 
-def translate_chown(args: list[str]) -> tuple[str | None, bool]:
+def translate_chmod(args: list[str]) -> tuple[str | None, bool]:
+    ui_manager.display_warning("CHMOD is currently disabled due to inconsistencies in translating POSIX permissions to Windows ACLs.")
+    ui_manager.display_info("For managing Windows permissions, please use 'icacls' directly in PowerShell/CMD, or PowerShell's Get-Acl/Set-Acl cmdlets.")
+    return NO_EXEC_MARKER + "chmod disabled message shown", False
+
+# def translate_chown(args: list[str]) -> tuple[str | None, bool]:
     parser = NonExitingArgumentParser(prog='chown', add_help=False)
     parser.add_argument('--help', action='store_true', help='Show Swodnil help for chown')
     parser.add_argument('-h', dest='help_short', action='store_true', help='Alias for --help')
@@ -738,6 +775,11 @@ def translate_chown(args: list[str]) -> tuple[str | None, bool]:
         return NO_EXEC_MARKER + "chown: no executable commands generated for any file.", False
 
     return " ; ".join(final_file_commands), True # Elevation always assumed for chown
+
+def translate_chown(args: list[str]) -> tuple[str | None, bool]:
+    ui_manager.display_warning("CHOWN is currently disabled due to inconsistencies in translating POSIX ownership to Windows equivalents.")
+    ui_manager.display_info("For managing Windows file ownership, please use 'icacls file /setowner user' directly in PowerShell/CMD (requires Admin), or PowerShell's Get-Acl/Set-Acl cmdlets.")
+    return NO_EXEC_MARKER + "chown disabled message shown", False
 
 # === Text Processing ===
 def translate_cat(args: list[str]) -> tuple[str | None, bool]:
